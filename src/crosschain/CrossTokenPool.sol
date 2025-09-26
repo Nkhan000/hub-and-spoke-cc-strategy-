@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.29;
+pragma solidity ^0.8.20;
 
 import {TokenPool} from "../../lib/ccip/contracts/src/v0.8/ccip/pools/TokenPool.sol";
 import {IERC20} from "../../lib/ccip/contracts/src/v0.8/vendor/openzeppelin-solidity/v4.8.3/contracts/token/ERC20/IERC20.sol";
@@ -20,10 +20,7 @@ contract CrossTokenPool is TokenPool {
         Pool.LockOrBurnInV1 calldata lockOrBurnIn
     ) external returns (Pool.LockOrBurnOutV1 memory lockOrBurnOut) {
         _validateLockOrBurn(lockOrBurnIn);
-        address orignalSender = abi.decode(
-            lockOrBurnIn.originalSender,
-            (address)
-        );
+        address orignalSender = lockOrBurnIn.originalSender;
         // custom logic to perform here
 
         // after the custom logic burn the tokens from this pool before sending them
@@ -31,12 +28,12 @@ contract CrossTokenPool is TokenPool {
 
         lockOrBurnOut = Pool.LockOrBurnOutV1({
             destTokenAddress: getRemoteToken(lockOrBurnIn.remoteChainSelector),
-            destPoolData: abi.endcode("custom data like interest rate")
+            destPoolData: abi.encode("custom data like interest rate")
         });
     }
 
     function releaseOrMint(
-        Pool.ReleaseOrMintV1 calldata releaseOrMintIn
+        Pool.ReleaseOrMintInV1 calldata releaseOrMintIn
     ) external returns (Pool.ReleaseOrMintOutV1 memory) {
         _validateReleaseOrMint(releaseOrMintIn);
 
