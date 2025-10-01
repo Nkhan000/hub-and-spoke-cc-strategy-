@@ -18,12 +18,4 @@ interface ISpoke {
         address receiver,
         address owner
     ) external returns (uint256);
-
-    function addLiquidityProvider(address _lp) external;
-
-    function removeLiquidityProvider(address _lp) external;
-
-    function sendDepositsToHub() external;
-
-    function receiveWithdrawalFromHub() external;
 }

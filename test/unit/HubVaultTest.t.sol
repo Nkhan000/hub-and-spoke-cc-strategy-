@@ -21,7 +21,7 @@ contract HubVaultTest is Test {
     function setUp() public {
         WETH = new ERC20Mock();
         vm.startPrank(owner);
-        vault = new HubVault(WETH);
+        // vault = new HubVault(WETH, _router, linkToken, TokenPool);
         vm.stopPrank();
 
         WETH.mint(lp, 200e18);
