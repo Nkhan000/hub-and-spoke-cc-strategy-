@@ -54,10 +54,10 @@ contract SpokeVault is
     mapping(address => uint256) private providerBalances;
 
     uint256 immutable i_MIN_DEPOSIT;
-    address public immutable i_linkToken;
-    address public immutable i_hub;
-    address public immutable i_tokenPool;
-    address public immutable i_router;
+    address public immutable LINK_TOKEN;
+    address public immutable HUB;
+    address public immutable TOKEN_POOL;
+    address public immutable ROUTER;
     uint64 private hubChainSelector;
     address private vault;
 
@@ -66,6 +66,24 @@ contract SpokeVault is
     uint256 private totalProfitEarned;
 
     EnumerableSet.AddressSet private allProviders;
+
+    struct liquidityProviderInfo {
+        address provider;
+        uint256 deposit;
+        uint256 unclaimedProfit;
+        uint256 lastDeposit;
+        uint256 lastWithdrawal;
+        bool isActive;
+    }
+
+    struct HubInfo {
+        address hub;
+        uint64 chainSelector;
+        uint256 totalAllocation;
+        uint256 totalProfitEarned;
+        uint256 lastAllocated;
+        uint256 lastWithdrawal;
+    }
 
     modifier notZeroAmount(uint256 amount) {
         require(amount > 0, SpokeVault__AmountMustBeMoreThanZero());
@@ -98,10 +116,10 @@ contract SpokeVault is
     {
         vault = _vault;
         i_MIN_DEPOSIT = minToken * 10 ** decimals();
-        i_hub = _hub;
-        i_linkToken = _link;
-        i_tokenPool = _tokenPool;
-        i_router = _router;
+        HUB = _hub;
+        LINK_TOKEN = _link;
+        TOKEN_POOL = _tokenPool;
+        ROUTER = _router;
     }
 
     function setHubChainSelector(uint64 _chainSelector) external onlyOwner {
@@ -280,7 +298,7 @@ contract SpokeVault is
     ////////////////// INTERNAL
 
     function _sentToHub(uint8 opcode, uint256 assets) internal {
-        require(i_hub != address(0), "i_hub chain not set");
+        require(HUB != address(0), "HUB chain not set");
 
         Client.EVMTokenAmount[]
             memory tokenAmounts = new Client.EVMTokenAmount[](1);
@@ -293,22 +311,22 @@ contract SpokeVault is
         bytes memory data = abi.encodePacked(opcode, assets, address(this));
 
         Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
-            receiver: abi.encode(i_hub),
+            receiver: abi.encode(HUB),
             data: data,
             tokenAmounts: tokenAmounts,
             extraArgs: Client._argsToBytes(
                 Client.EVMExtraArgsV1({gasLimit: 200_000})
             ),
-            feeToken: i_linkToken
+            feeToken: LINK_TOKEN
         });
 
         // approving token pool to spend the asset
-        IERC20(asset()).approve(i_tokenPool, assets);
+        IERC20(asset()).approve(TOKEN_POOL, assets);
 
         // Compute fee
-        uint256 fee = IRouterClient(i_router).getFee(hubChainSelector, message);
-        IERC20(i_linkToken).approve(address(i_router), fee);
-        IRouterClient(i_router).ccipSend(hubChainSelector, message);
+        uint256 fee = IRouterClient(ROUTER).getFee(hubChainSelector, message);
+        IERC20(LINK_TOKEN).approve(address(ROUTER), fee);
+        IRouterClient(ROUTER).ccipSend(hubChainSelector, message);
     }
 
     // function _ccipReceive() internal override {}
@@ -318,7 +336,7 @@ contract SpokeVault is
         // Accept messages only from destinated chain selector
         require(
             message.sourceChainSelector == hubChainSelector &&
-                abi.decode(message.sender, (address)) == i_hub,
+                abi.decode(message.sender, (address)) == HUB,
             "INVALID SENDER"
         );
 

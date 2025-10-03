@@ -14,6 +14,7 @@ import {IStrategy} from "../strategies/IStrategy.sol";
 import {Client} from "../../lib/ccip/contracts/src/v0.8/ccip/libraries/Client.sol";
 import {IRouterClient} from "../../lib/ccip/contracts/src/v0.8/ccip/interfaces/IRouterClient.sol";
 import {CCIPReceiver} from "../../lib/ccip/contracts/src/v0.8/ccip/applications/CCIPReceiver.sol";
+import {AccessControl} from "../../lib/openzeppelin-contracts/contracts/access/AccessControl.sol";
 
 /**
  * @title HubVault
@@ -21,9 +22,24 @@ import {CCIPReceiver} from "../../lib/ccip/contracts/src/v0.8/ccip/applications/
  * @notice Receives ERC20 token from liquidity providers and spoke vaults on from different chain use the funds in the different strategies to yield profits
  */
 
-contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
+contract HubVault is
+    ERC4626,
+    AccessControl,
+    ReentrancyGuard,
+    Pausable,
+    CCIPReceiver
+{
     using SafeERC20 for IERC20;
     using EnumerableSet for EnumerableSet.AddressSet;
+
+    /// @dev Required to resolve multiple inheritance of supportsInterface
+    function supportsInterface(
+        bytes4 interfaceId
+    ) public view override(AccessControl, CCIPReceiver) returns (bool) {
+        return
+            AccessControl.supportsInterface(interfaceId) ||
+            CCIPReceiver.supportsInterface(interfaceId);
+    }
 
     // ERRORS
     error HubVault__AmountMustBeMoreThanZero();
@@ -34,6 +50,7 @@ contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
     error HubVault__SpokeNotAllowed(address spoke);
     error HubVault__OnlySpokesReceiveShares();
     error HubVault__OnlySpokesWithdrawAssets();
+    error HubVault__TooManySpokes();
 
     error HubVault__CanNotDirectlyWithdrawCrossChain();
 
@@ -44,54 +61,147 @@ contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
         address msgSender
     );
     error HubVault__InsufficientFundsToWithdraw();
+    error HubVault__WithdrawFundsFirst();
 
     error HubVault__NotMsgSenderOrSpoke(address spoke);
     error HubVault__NotMsgSenderOrOwner(address spoke);
     error HubVault__NotEnoughSpokeBalances();
     error HubVault__NotEnoughProfitAccrued();
 
-    error HubVault__InvalidChainSelector(uint256 destChainSelector);
+    error HubVault__InvalidChainSelector();
     error HubVault__InvalidOpcode();
     error HubVault__InvalidTokenCCIP();
     error HubVault__TokensMisMatchCCIP();
+    error HubVault__InvalidAddress();
 
-    uint256 constant PERFORMANCE_FEE = 300;
+    // ============================================
+    // ROLES
+    // ============================================
 
-    uint256 immutable i_MIN_PROFIT;
-    uint256 private totalAllocations; // total amount allocated to strategies
-    uint256 private totalFeesCollected; // amount collected from profits generated for the owner
+    bytes32 public constant HARVESTER_ROLE = keccak256("HARVESTER");
+    bytes32 public constant ALLOCATOR_ROLE = keccak256("ALLOCATOR");
+    bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY");
+    bytes32 public constant KEEPER_ROLE = keccak256("KEEPER");
 
-    uint256 private totalSpokeDeposits; // total balance of spoke vaults deposited
+    // ============================================
+    // CONSTANTS
+    // ============================================
+    uint256 public constant PERFORMANCE_FEE = 300; // 3%
+    uint256 public constant MAX_PERFORMANCE_FEE = 2000; // 20% cap
+    uint256 public constant BASIS_POINTS = 10000;
+    uint256 public constant MAX_STRATEGIES = 3;
+    uint256 public constant MAX_SPOKES = 4;
+    uint256 public constant PROFIT_DISTRIBUTION_THRESHOLD = 100e18;
+    uint256 public constant MAX_SPOKES_PER_DISTRIBUTION = 50;
+    uint256 public constant MINIMUM_DEPOSIT = 1e6; // 1 USDC minimum
+    uint256 public constant VIRTUAL_SHARES = 1e3;
+    uint256 public constant VIRTUAL_ASSETS = 1;
+    uint256 public constant MIN_LINK_THRESHOLD = 10e18; // 10 LINK
+    uint256 public constant MAX_RETRIES = 3;
+    uint256 public constant RETRY_DELAY = 1 hours;
+    uint256 public constant WITHDRAWAL_DELAY = 10 minutes;
+    uint256 public constant TIMELOCK_DELAY = 48 hours;
 
+    // ============================================
+    // IMMUTABLES
+    // ============================================
+    uint256 public immutable MIN_PROFIT;
+    address public immutable LINK_TOKEN;
+    address public immutable TOKEN_POOL;
+    address public immutable ROUTER;
+
+    // ============================================
+    // STATE VARIABLES - Storage Layout Optimized
+    // ============================================
+
+    // Slot 1-4: Basic accounting
+    uint256 public totalAllocations;
+    uint256 public totalFeesCollected;
+    uint256 public totalSpokeDeposits;
     uint256 private totalProfitAfterFee; // total profits collected from strategies after deducting protocol fee
-    uint256 private totalRealizedLosses; // total loss from profits
 
-    address public immutable i_linkToken; //
+    // Slot 5-8: Tracking variables
+    uint256 public totalRealizedLosses;
+    uint256 public lastHarvestTimestamp;
+    uint256 public lastDistributionIndex;
+    uint256 public totalWithdrawalRequests;
 
-    address public immutable i_tokenPool; // address of token pool on this chain
-    address public immutable i_router; // address to router client from ccip
+    // Slot 9-10: Configuration
+    uint256 public minHarvestInterval;
+    uint256 public maxSlippageBps;
 
-    // maps all allocations to the strategy
-    mapping(address => uint256) internal strategyAllocations;
-    //
-    mapping(address => bool) internal isAllowedStrategy;
+    // Slot 11: Packed booleans
+    bool public emergencyMode;
+    bool public distributionInProgress;
+
+    // ============================================
+    // MAPPINGS
+    // ============================================
+
+    // Strategy mappings
+    mapping(address => uint256) public strategyAllocations;
+    mapping(address => bool) public isAllowedStrategy;
+    mapping(address => bool) public strategyPaused;
+    mapping(address => StrategyInfo) public strategyInfo;
+
     // spoke vaults deposits mapping
     mapping(address => uint256) internal spokesDeposit;
-    //
-    mapping(address => bool) internal isAllowedSpoke;
-    //
     mapping(address => uint64) internal spokeChainSelectors;
-    //
-    mapping(address => uint256) internal spokesProfit;
+    mapping(address => bool) internal isAllowedSpoke;
+    mapping(address => SpokeInfo) public spokeInfo;
+
+    // CCIP mappings
+    mapping(uint64 => uint256) public chainGasLimits;
+    // mapping(bytes32 => FailedMessage) public failedMessages;
+
+    // Withdrawal queue mappings
+    mapping(address => uint256[]) public spokeWithdrawalRequests;
+    mapping(uint256 => WithdrawalRequest) public withdrawalQueue;
+
+    // Timelock mappings
+    // mapping(bytes32 => TimelockOperation) public timelockOps;
 
     // arrays
     EnumerableSet.AddressSet private allStrategies;
     EnumerableSet.AddressSet private allSpokeVaults;
 
+    // ============================================
+    // STRUCTS
+    // ============================================
+
+    struct StrategyInfo {
+        uint256 allocation;
+        uint256 totalProfit;
+        uint256 totalLoss;
+        uint256 lastHarvest;
+        uint256 consecutiveLosses;
+        bool isActive;
+    }
+
+    struct WithdrawalRequest {
+        address spoke;
+        uint256 amount;
+        uint256 shares;
+        uint256 requestTime;
+        uint256 priority; // Higher for longer-term depositors
+        bool fulfilled;
+    }
+
+    struct SpokeInfo {
+        uint256 deposits;
+        uint256 shares;
+        uint256 unclaimedProfit;
+        uint256 lastDeposit;
+        uint256 lastWithdrawal;
+        uint64 chainSelector;
+    }
+
+    // ===================================
+
     /// EVENTS
     event StrategyAdded(address _strategy);
     event SpokeAdded(address _spoke);
-    event StrategyRemoved(address _strategy);
+    event StrategyRemoved(address _strategy, uint256 timestamp);
     event SpokeRemoved(address _spoke);
 
     event StrategyFundsAllocated(address strategy, uint256 amount);
@@ -125,35 +235,39 @@ contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
         address _router,
         address _linkToken,
         address _tokenPool
-    )
-        ERC4626(_asset)
-        CCIPReceiver(_router)
-        ERC20("Cross Token", "CT")
-        Ownable(msg.sender)
-    {
-        require(_tokenPool != address(0), "Invalid token pool address");
+    ) ERC4626(_asset) CCIPReceiver(_router) ERC20("Cross Token", "CT") {
+        if (
+            _tokenPool == address(0) ||
+            ROUTER == address(0) ||
+            _linkToken == address(0)
+        ) revert HubVault__InvalidAddress();
 
-        i_MIN_PROFIT = 20 * 10 ** decimals();
-        i_tokenPool = _tokenPool;
-        i_linkToken = _linkToken;
+        MIN_PROFIT = 20 * 10 ** decimals();
+        TOKEN_POOL = _tokenPool;
+        LINK_TOKEN = _linkToken;
+
+        // Setup roles
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(HARVESTER_ROLE, msg.sender);
+        _grantRole(ALLOCATOR_ROLE, msg.sender);
+        _grantRole(EMERGENCY_ROLE, msg.sender);
+        _grantRole(KEEPER_ROLE, msg.sender);
     }
 
     /////////////// modifiers
-    modifier allowedStrategy(address strategy) {
-        require(
-            isAllowedStrategy[strategy],
-            HubVault__StrategyNotAllowed(strategy)
-        );
+    modifier onlyAllowedStrategy(address strategy) {
+        if (!isAllowedStrategy[strategy])
+            revert HubVault__StrategyNotAllowed(strategy);
+        _;
+    }
+
+    modifier onlyAllowedSpoke(address spoke) {
+        if (isAllowedSpoke[spoke]) revert HubVault__SpokeNotAllowed(spoke);
         _;
     }
 
     modifier notZeroAmount(uint256 amount) {
-        require(amount > 0, HubVault__AmountMustBeMoreThanZero());
-        _;
-    }
-
-    modifier allowedSpoke(address spoke) {
-        require(isAllowedSpoke[spoke], HubVault__SpokeNotAllowed(spoke));
+        if (amount == 0) revert HubVault__AmountMustBeMoreThanZero();
         _;
     }
 
@@ -165,56 +279,104 @@ contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
         _;
     }
 
+    // ============================================
+    // STRATEGY MANAGEMENT
+    // ============================================
+
     // add strategies like Uniswap or AAVE
-    function addStrategy(address _strategy) external onlyOwner nonReentrant {
-        require(!isAllowedStrategy[_strategy], "Strategy already listed");
-        require(allStrategies.add(_strategy), "Failed to add strategy");
+    function addStrategy(
+        address _strategy
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        if (_strategy == address(0)) revert HubVault__InvalidAddress();
+        if (isAllowedStrategy[_strategy])
+            revert HubVault__StrategyNotAllowed(_strategy);
+        if (!allStrategies.add(_strategy)) revert("Failed to add strategy");
 
         isAllowedStrategy[_strategy] = true;
+        strategyInfo[_strategy] = StrategyInfo({
+            allocation: 0,
+            totalProfit: 0,
+            totalLoss: 0,
+            lastHarvest: block.timestamp,
+            consecutiveLosses: 0,
+            isActive: true
+        });
         emit StrategyAdded(_strategy);
     }
 
     function removeStrategy(
         address _strategy
-    ) external onlyOwner nonReentrant whenPaused {
-        require(isAllowedStrategy[_strategy], "Strategy already removed");
-        require(allStrategies.remove(_strategy), "Failed to remove strategy");
-        require(strategyAllocations[_strategy] == 0, "withdraw funds first");
-        delete isAllowedStrategy[_strategy];
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant whenPaused {
+        if (!isAllowedStrategy[_strategy])
+            revert HubVault__StrategyNotAllowed(_strategy);
+        if (strategyAllocations[_strategy] != 0)
+            revert HubVault__WithdrawFundsFirst();
+        if (!allStrategies.remove(_strategy))
+            revert("Failed to remove strategy");
 
-        emit StrategyRemoved(_strategy);
+        delete isAllowedStrategy[_strategy];
+        strategyInfo[_strategy].isActive = false;
+
+        emit StrategyRemoved(_strategy, block.timestamp);
     }
+
+    // ============================================
+    // SPOKE MANAGEMENT
+    // ============================================
 
     function addSpoke(
         address _spoke,
         uint64 chainSelector
-    ) external onlyOwner nonReentrant {
-        require(!isAllowedSpoke[_spoke], "Spoke already listed");
-        require(allSpokeVaults.add(_spoke), "Failed to add spoke");
-        require(chainSelector == 0, "Chain selector can not be zero");
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        if (_spoke == address(0)) revert HubVault__InvalidAddress();
+        if (isAllowedSpoke[_spoke]) revert HubVault__SpokeNotAllowed(_spoke); // spoke already exists maybe a better error message would do
+        if (chainSelector == 0) revert HubVault__InvalidChainSelector();
+        if (allSpokeVaults.length() >= MAX_SPOKES)
+            revert HubVault__TooManySpokes();
+        if (!allSpokeVaults.add(_spoke)) revert("Failed to add spoke");
 
-        spokeChainSelectors[_spoke] = chainSelector;
         isAllowedSpoke[_spoke] = true;
-        // emit event
+        spokeInfo[_spoke] = SpokeInfo({
+            deposits: 0,
+            shares: 0,
+            unclaimedProfit: 0,
+            lastDeposit: block.timestamp,
+            lastWithdrawal: block.timestamp,
+            chainSelector: chainSelector
+        });
+
         emit SpokeAdded(_spoke);
     }
 
     function removeSpoke(
         address _spoke
-    ) external onlyOwner nonReentrant whenPaused {
-        require(isAllowedSpoke[_spoke], "Spoke already removed");
-        require(allSpokeVaults.remove(_spoke), "Failed to remove spoke");
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant whenPaused {
+        if (!isAllowedSpoke[_spoke]) revert HubVault__SpokeNotAllowed(_spoke);
+        if (!allSpokeVaults.remove(_spoke)) revert("Failed to remove spoke");
 
-        delete isAllowedSpoke[_spoke];
-        delete spokeChainSelectors[_spoke];
+        SpokeInfo memory s = spokeInfo[_spoke];
+        uint256 deposits = s.deposits;
+        uint256 unclaimedProfit = s.unclaimedProfit;
 
-        // Optionally: Transfer remaining balance to owner or spoke
-        uint256 amount = spokesDeposit[_spoke];
-        if (amount > 0) {
-            spokesDeposit[_spoke] = 0;
-            totalSpokeDeposits -= amount;
-            IERC20(asset()).safeTransfer(_spoke, amount);
+        uint256 totalBalanceToPay = deposits + unclaimedProfit;
+
+        delete isAllowedSpoke[_spoke]; //
+        delete spokeChainSelectors[_spoke]; //
+        delete spokeInfo[_spoke]; //
+
+        if (totalBalanceToPay > 0) {
+            if (
+                s.chainSelector != 0 && s.chainSelector != uint64(block.chainid)
+            ) {
+                // send cross chain
+                withdraw(totalBalanceToPay, address(this), _spoke); // burn the shares that was minted to this contract
+                _sendCrossChain(_spoke, totalBalanceToPay);
+            } else {
+                // native transfer
+                super.withdraw(totalBalanceToPay, _spoke, _spoke); // burn the erc4626 vault shares and transfer underlying assets
+            }
         }
+        totalSpokeDeposits -= deposits;
         emit SpokeRemoved(_spoke);
     }
 
@@ -225,105 +387,135 @@ contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
     function allocateFundsToStrategy(
         address strategy,
         uint256 amount
-    ) external onlyOwner whenNotPaused nonReentrant allowedStrategy(strategy) {
+    )
+        external
+        onlyRole(ALLOCATOR_ROLE)
+        whenNotPaused
+        nonReentrant
+        onlyAllowedStrategy(strategy)
+        notZeroAmount(amount)
+    {
         // CHECKS
-        require(
-            amount <= IERC20(asset()).balanceOf(address(this)),
-            "Insufficient funds in the vault"
-        );
+        if (amount > IERC20(asset()).balanceOf(address(this)))
+            revert("Insufficient funds in the vault");
 
         // EFFECTS
-        unchecked {
-            strategyAllocations[strategy] += amount;
-            totalAllocations += amount;
-        }
+        strategyInfo[strategy].allocation += amount;
+        totalAllocations += amount;
 
         // INTERACTION
         IERC20(asset()).approve(strategy, amount);
         bool success = IStrategy(strategy).deposit(amount); // strategy pulls asset
-        require(success, HubVault__FundsAllocationFailed());
+        if (!success) revert HubVault__FundsAllocationFailed();
 
         emit StrategyFundsAllocated(strategy, amount);
     }
 
-    // it assumes that strategy contract has allowed to transfer funds to this contract
     function withdrawFromStrategy(
         address strategy,
         uint256 amount
-    ) public onlyOwner nonReentrant whenNotPaused allowedStrategy(strategy) {
+    )
+        public
+        onlyRole(ALLOCATOR_ROLE)
+        nonReentrant
+        whenNotPaused
+        onlyAllowedStrategy(strategy)
+    {
         _harvest(strategy); // settles all profits and losses made
-        require(
-            strategyAllocations[strategy] >= amount,
-            "Not enough allocated"
-        );
-        uint256 totalAllocated = strategyAllocations[strategy];
-        require(totalAllocated > 0, "Strategy has no funds");
+        StrategyInfo storage s = strategyInfo[strategy];
+        bool success;
 
-        // Sync allocations with actual strategy state
         // In case of emergency withdraw
         if (amount == type(uint256).max) {
-            strategyAllocations[strategy] = 0;
-            totalAllocations -= totalAllocated;
-            bool success = IStrategy(strategy).withdrawAll();
-            require(success, HubVault__WithdrawalFailed(strategy));
+            totalAllocations -= s.allocation;
+            s.allocation = 0;
+            success = IStrategy(strategy).withdrawAll();
         } else {
+            if (amount > s.allocation) revert("Not enough allocated");
             // EFFECTS
-            strategyAllocations[strategy] -= amount;
             totalAllocations -= amount;
-
-            // TODO
-            bool success = IStrategy(strategy).withdraw(amount);
-            require(success, HubVault__WithdrawalFailed(strategy));
+            s.allocation -= amount;
+            success = IStrategy(strategy).withdraw(amount);
         }
+        if (!success) revert HubVault__WithdrawalFailed(strategy);
 
         emit StrategyFundsWithdrawn(strategy, amount);
     }
 
+    // ============================================
+    // HARVEST & PROFIT MANAGEMENT
+    // ============================================
     // This functions should collect the acrued profit from the strategy to this vault
     function _harvest(
         address strategy
-    ) internal onlyOwner nonReentrant whenNotPaused allowedStrategy(strategy) {
+    )
+        internal
+        onlyRole(HARVESTER_ROLE)
+        nonReentrant
+        whenNotPaused
+        onlyAllowedStrategy(strategy)
+    {
+        if (
+            block.timestamp <
+            strategyInfo[strategy].lastHarvest + minHarvestInterval
+        ) {
+            return; // minimum harvesting interval not reached yet
+        }
         uint256 initialVaultBalance = IERC20(asset()).balanceOf(address(this));
 
         // reports profit or loss
         (uint256 profit, uint256 loss) = IStrategy(strategy)
             .reportProfitAndLoss();
 
-        require(
-            profit == 0 || loss == 0,
-            "Profit and loss cannot both be non-zero"
-        ); // Enforces mutual exclusivity
+        if (profit > 0 || loss > 0)
+            revert("Profit and loss cannot both be non-zero"); // Enforces mutual exclusivity
+        StrategyInfo storage s = strategyInfo[strategy];
 
         if (profit > 0) {
-            require(profit >= i_MIN_PROFIT, "NOT ENOUGH PROFIT");
+            if (profit < MIN_PROFIT) revert("NOT ENOUGH PROFIT");
 
             IStrategy(strategy).collectAllProfits();
             // verify profit was transfered
             uint256 received = IERC20(asset()).balanceOf(address(this)) -
                 initialVaultBalance;
-            require(received >= profit, "Profit not received");
+            if (received < profit) revert("Profits Withdrawal Failed");
 
             // Calculate and record fee
-            uint256 fee = (profit * PERFORMANCE_FEE) / 10000;
-            require(fee <= profit, "Invalid performance fee");
+            uint256 fee = (profit * PERFORMANCE_FEE) / BASIS_POINTS;
+            if (fee >= profit) revert("Invalid performance fee");
 
             totalFeesCollected += fee;
+            uint256 profitAfterFee = profit - fee;
+            totalProfitAfterFee += profitAfterFee;
 
-            totalProfitAfterFee += profit - fee;
-            _distributeProfitAmongSpokes();
+            s.totalProfit += profit;
+            s.lastHarvest = block.timestamp;
+            s.consecutiveLosses = 0; // Reset loss counter
+            lastHarvestTimestamp = block.timestamp;
+
+            // Auto-distribute if threshold reached
+            if (totalProfitAfterFee >= PROFIT_DISTRIBUTION_THRESHOLD) {
+                _distributeProfitAmongSpokes();
+            }
 
             emit ProfitsCollected(strategy, profit, fee);
         } else if (loss > 0) {
+            uint256 preLossAllocations = s.allocation;
+
+            if (preLossAllocations < loss) {
+                revert("AllocationsExceedsBalance");
+            }
             //
-            require(
-                strategyAllocations[strategy] >= loss,
-                "Losses exceeds allocations"
-            );
-            strategyAllocations[strategy] -= loss;
+            s.allocation -= loss;
             totalAllocations -= loss;
             totalRealizedLosses += loss;
+            s.totalLoss += loss;
+            s.lastHarvest = block.timestamp;
+            s.consecutiveLosses++;
 
             emit LossRealized(strategy, loss);
+
+            // based on lossCounter may discontinue the or pause the strategy for few period of time
         }
     }
 
@@ -341,34 +533,48 @@ contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
             // increase total profit distributed for dust calculation at the end
             totalDistributed += profitToPay;
             // add the profit to the spokes profits mapping for quick
-            spokesProfit[spoke] += profitToPay;
+            SpokeInfo storage s = spokeInfo[spoke];
+            s.unclaimedProfit += profitToPay;
             // decrease the profit to from the total profit
             totalProfit -= profitToPay;
-
-            deposit(profitToPay, spoke);
         }
 
         uint256 remaining = totalProfit - totalDistributed;
         if (remaining > 0) {
             totalFeesCollected += remaining;
-            totalProfit = 0;
+            totalProfitAfterFee = 0;
         }
+        // emit
+    }
+
+    function claimProfitFor(address spoke) internal {
+        SpokeInfo storage s = spokeInfo[spoke];
+        uint256 profitToPay = s.unclaimedProfit;
+
+        if (profitToPay == 0) return;
+
+        s.unclaimedProfit = 0;
+        totalSpokeDeposits += profitToPay;
+
+        deposit(profitToPay, spoke);
+
+        // emit profitClaimed
     }
 
     ///////////// LOCAL FUNCTIONS FOR SPOKES FOR  /////////////////////
     ///////////// PROFIT AND DEPOSIT WITHDRAWALS /////////////////////
 
     ///////////////////////////////////////////////////////
-    /////////////////// OWNER CLAIMS /////////////////////
+    /////////////////// ADMIN FUNCTIONS //////////////////
     /////////////////////////////////////////////////////
 
     // transfer collected fees to the owner
     function claimFees(
         address to
-    ) external onlyOwner whenNotPaused nonReentrant {
-        require(to != address(0), "Invalid address");
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) whenNotPaused nonReentrant {
+        if (to == address(0)) revert("Invalid address");
         uint256 amount = totalFeesCollected;
-        require(amount > 0, "Not Enough Amount to Collect");
+        if (amount == 0) revert("Not Enough Amount to Collect");
 
         totalFeesCollected = 0;
         IERC20(asset()).approve(to, amount);
@@ -389,7 +595,7 @@ contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
 
     function deposit(
         uint256 assets,
-        address receiver // sender of the tokens cross chain passed as a receiver
+        address receiver // sender of the tokens cross chain or native passed as a receiver (spoke)
     )
         public
         override
@@ -399,19 +605,23 @@ contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
         returns (uint256)
     {
         uint256 shares;
-        // if msg.sender is this contract than it is a cross chain operation
-        if (msg.sender == address(this)) {
+        uint256 expectedShares = previewDeposit(assets);
+        uint64 chainSelector = spokeInfo[receiver].chainSelector;
+        // if chain selector is for different chain than deposit on behalf of that spoke vault and mint shares to this contract
+        // if not then spoke is a native spoke and mint shares to them directly.
+
+        if (chainSelector != 0 && chainSelector != uint64(block.chainid)) {
+            // it is spoke on different chain
             shares = super.deposit(assets, address(this));
         } else {
-            // else it is a native operation
             if (receiver != msg.sender)
                 revert HubVault__OnlySpokesReceiveShares();
             shares = super.deposit(assets, receiver);
         }
+        require(shares >= expectedShares, "Slippage exceeded"); // Protection
         _afterDeposit(assets, receiver);
 
         emit DepositSuccessfull(receiver, assets);
-
         return shares;
     }
 
@@ -419,22 +629,23 @@ contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
         uint256 shares,
         address receiver
     ) public override returns (uint256) {
-        uint256 expectedAssets = previewMint(shares);
         uint256 assetsMinted;
-        if (msg.sender == address(this)) {
-            // if (!isAllowedSpoke[receiver])
-            //     revert HubVault__SpokeNotAllowed(receiver);
+        uint256 expectedAssets = previewMint(shares);
+
+        uint64 chainSelector = spokeInfo[receiver].chainSelector;
+        if (chainSelector != 0 && chainSelector != uint64(block.chainid)) {
+            // it is a cross chain spoke
             assetsMinted = super.mint(shares, address(this));
         } else {
-            //
             if (!isAllowedSpoke[msg.sender])
                 revert HubVault__SpokeNotAllowed(msg.sender);
-            if (receiver == msg.sender)
+            if (receiver != msg.sender)
                 revert HubVault__OnlySpokesReceiveShares();
-            assetsMinted = super.mint(shares, msg.sender);
+            assetsMinted = super.mint(shares, receiver);
         }
-        if (assetsMinted < expectedAssets)
-            revert HubVault__AssetsMisMatched(assetsMinted, expectedAssets);
+        // maybe add some slippage protection here, revert if not minted
+        require(assetsMinted >= expectedAssets, "Slippage exceeded");
+
         _afterDeposit(assetsMinted, receiver);
 
         emit AssetsDepositedSharesMinted(receiver, assetsMinted, shares);
@@ -451,38 +662,36 @@ contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
         override
         nonReentrant
         whenNotPaused
-        allowedSpoke(owner)
+        onlyAllowedSpoke(owner)
+        notZeroAmount(assets)
         returns (uint256)
     {
         // here msg.sender should be the called of this function tokens are being sent cross chain
         // also receiver should also be the address(this) as can not do .safeTransfer to a cross chain contract
-        if (spokesDeposit[owner] < assets)
-            revert HubVault__InsufficientFundsToWithdraw();
-        // cross chain transfer
-        if (msg.sender == address(this)) {
-            // burn shares from this contract based on amount of deposit made
-            // sends the token back to this contract from this contract
-            uint256 shares = super.withdraw(
-                assets,
-                address(this), // receiver of the asset is this contract
-                address(this) // owner of the shares is this contract
-            );
 
-            spokesDeposit[owner] -= assets; // updates the balance of spoke
-            totalSpokeDeposits -= assets; // updates the total deposits of all spokes
-            _sendCrossChain(owner, assets); // sends the tokens cross chain
-            emit AssetsWithdrawnSharesBurnt(assets, shares);
-            return shares;
-            // called from a native spoke vault
+        uint256 sharesBurnt;
+        uint256 expectedSharesToBurn = previewWithdraw(assets);
+        SpokeInfo storage s = spokeInfo[owner];
+
+        uint64 chainSelector = s.chainSelector;
+        bool isCrossChain = chainSelector != 0 &&
+            chainSelector != uint64(block.chainid);
+
+        if (isCrossChain) {
+            sharesBurnt = super.withdraw(assets, address(this), address(this));
+            _sendCrossChain(owner, assets);
         } else {
-            unchecked {
-                spokesDeposit[owner] -= assets;
-                totalSpokeDeposits -= assets;
-            }
-            uint256 shares = super.withdraw(assets, receiver, owner);
-            emit AssetsWithdrawnSharesBurnt(assets, shares);
-            return shares;
+            sharesBurnt = super.withdraw(assets, receiver, owner);
         }
+        require(sharesBurnt >= expectedSharesToBurn, "Slippage Exceeds");
+
+        unchecked {
+            s.deposits -= assets;
+            totalSpokeDeposits -= assets;
+        }
+        s.lastWithdrawal = block.timestamp;
+        emit AssetsWithdrawnSharesBurnt(assets, sharesBurnt);
+        return sharesBurnt;
     }
 
     function redeem(
@@ -494,27 +703,34 @@ contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
         override
         nonReentrant
         whenNotPaused
-        allowedSpokeAndSender(owner)
+        onlyAllowedSpoke(owner)
         notZeroAmount(shares)
         returns (uint256)
     {
-        // uint256 assets = previewRedeem(shares);
-        if (msg.sender == address(this)) {
-            // TODO
+        uint256 assets;
+        uint256 expectedAssets = previewRedeem(shares);
+        SpokeInfo storage s = spokeInfo[owner];
+
+        uint64 chainSelector = s.chainSelector;
+        bool isCrossChain = chainSelector != 0 &&
+            chainSelector != uint64(block.chainid);
+
+        if (isCrossChain) {
+            assets = super.redeem(shares, address(this), address(this));
+            _sendCrossChain(owner, assets);
         } else {
-            uint256 assets = super.redeem(shares, receiver, owner);
-            // _beforeWithdraw();
-            require(
-                spokesDeposit[owner] >= assets,
-                "Insufficient funds to withdraw"
-            );
-
-            spokesDeposit[owner] -= assets;
-            totalSpokeDeposits -= assets;
-
-            emit AssetsWithdrawnSharesBurnt(assets, shares);
-            return assets;
+            assets = super.redeem(shares, receiver, owner);
         }
+        require(assets >= expectedAssets, "Slippage Exceeds");
+
+        unchecked {
+            s.deposits -= assets;
+            totalSpokeDeposits -= assets;
+        }
+        s.lastWithdrawal = block.timestamp;
+
+        emit AssetsWithdrawnSharesBurnt(assets, shares);
+        return assets;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -526,8 +742,7 @@ contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
         uint256 _amountToPay
     ) internal returns (bool, bytes32) {
         uint64 destChainSelector = spokeChainSelectors[_spoke];
-        if (destChainSelector == 0)
-            revert HubVault__InvalidChainSelector(destChainSelector);
+        if (destChainSelector == 0) revert HubVault__InvalidChainSelector();
 
         Client.EVMTokenAmount[]
             memory tokenAmounts = new Client.EVMTokenAmount[](1);
@@ -543,18 +758,15 @@ contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
             extraArgs: Client._argsToBytes(
                 Client.EVMExtraArgsV1({gasLimit: 1_00_000})
             ),
-            feeToken: i_linkToken
+            feeToken: LINK_TOKEN
         });
 
-        uint256 fee = IRouterClient(i_router).getFee(
-            destChainSelector,
-            message
-        );
+        uint256 fee = IRouterClient(ROUTER).getFee(destChainSelector, message);
 
-        IERC20(i_linkToken).approve(i_router, fee);
-        IERC20(asset()).approve(i_tokenPool, _amountToPay);
+        IERC20(LINK_TOKEN).approve(ROUTER, fee);
+        IERC20(asset()).approve(TOKEN_POOL, _amountToPay);
 
-        bytes32 messageId = IRouterClient(i_router).ccipSend(
+        bytes32 messageId = IRouterClient(ROUTER).ccipSend(
             destChainSelector,
             message
         );
@@ -605,10 +817,11 @@ contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
     }
 
     function _afterDeposit(uint256 assets, address receiver) internal {
+        SpokeInfo storage s = spokeInfo[receiver];
         unchecked {
-            spokesDeposit[receiver] += assets;
-            totalSpokeDeposits += assets;
+            s.deposits += assets;
         }
+        s.lastDeposit = block.timestamp;
     }
 
     // function _beforeWithdraw() internal {
@@ -643,11 +856,11 @@ contract HubVault is ERC4626, Ownable, ReentrancyGuard, Pausable, CCIPReceiver {
     }
 
     // Emergency functions
-    function pause() external onlyOwner {
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
         _pause();
     }
 
-    function unpause() external onlyOwner {
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
         _unpause();
     }
 }
