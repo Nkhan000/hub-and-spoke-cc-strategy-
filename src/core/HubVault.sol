@@ -357,6 +357,7 @@ contract HubVault is
         SpokeInfo memory s = spokeInfo[_spoke];
         uint256 deposits = s.deposits;
         uint256 unclaimedProfit = s.unclaimedProfit;
+        // @audit
 
         uint256 totalBalanceToPay = deposits + unclaimedProfit;
 
@@ -804,10 +805,10 @@ contract HubVault is
 
         // _harvest(strategy);
 
-        if (opcode == uint8(1)) {
+        if (opcode == uint8(0)) {
             // deposit sent amounts
             deposit(amount, sender);
-        } else if (opcode == uint8(2)) {
+        } else if (opcode == uint8(1)) {
             // withdraw and send amounts
             withdraw(amount, address(0), sender);
         } else {

@@ -12,7 +12,7 @@ import {EnumerableSet} from "../../lib/openzeppelin-contracts/contracts/utils/st
 import {SafeERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {CCIPReceiver} from "../../lib/ccip/contracts/src/v0.8/ccip/applications/CCIPReceiver.sol";
 import {IRouterClient} from "../../lib/ccip/contracts/src/v0.8/ccip/interfaces/IRouterClient.sol";
-
+import {AccessControl} from "../../lib/openzeppelin-contracts/contracts/access/AccessControl.sol";
 import {Client} from "../../lib/ccip/contracts/src/v0.8/ccip/libraries/Client.sol";
 
 interface IHubVault {
@@ -28,13 +28,22 @@ interface IHubVault {
 
 contract SpokeVault is
     ERC4626,
-    Ownable,
+    AccessControl,
     Pausable,
     ReentrancyGuard,
     CCIPReceiver
 {
     using SafeERC20 for IERC20;
     using EnumerableSet for EnumerableSet.AddressSet;
+
+    /// @dev Required to resolve multiple inheritance of supportsInterface
+    function supportsInterface(
+        bytes4 interfaceId
+    ) public view override(AccessControl, CCIPReceiver) returns (bool) {
+        return
+            AccessControl.supportsInterface(interfaceId) ||
+            CCIPReceiver.supportsInterface(interfaceId);
+    }
 
     // ERROR
     error SpokeVault__AmountMustBeMoreThanZero();
@@ -45,29 +54,51 @@ contract SpokeVault is
     event DepositSuccessfull(address lp, uint256 amount);
     event DepositsTransferedToVault(uint256 amount);
 
+    event WithdrawSuccessfull(address lp, uint256 amount);
+
+    event LiquidityProviderAdded(address _provider);
+    event LiquidityProviderRemoved(address _provider);
+
     event FundsReceived(uint256 amount);
-    event LiquidityProviderAddess(address _provider);
     event ProfitsClaim(address provider, uint256 profitsToPay);
+    event CCIPMessageSent(
+        bytes32 messageId,
+        address hub,
+        uint64 chainSelector,
+        uint256 assets,
+        uint8 opcode
+    );
+
+    mapping(address => bool) private allowedProviders;
+    mapping(address => uint256) private providerBalances;
+    mapping(address => LiquidityProviderInfo) private providerInfo;
+
+    enum Operations {
+        DEPOSIT,
+        WITHDRAW
+    }
+
+    // ============================================
+    // ROLES
+    // ============================================
+
+    bytes32 public constant PROVIDER_ROLE = keccak256("LIQUIDITY_PROVIDER");
 
     // STATE VARIABLES
-    mapping(address => bool) private providers;
-    mapping(address => uint256) private providerBalances;
+    uint256 private immutable MIN_DEPOSIT;
+    address private immutable LINK_TOKEN;
+    address private immutable TOKEN_POOL;
+    address private immutable ROUTER;
+    uint256 constant MIN_PROFIT = 1e6;
+    HubInfo private hubVault;
 
-    uint256 immutable i_MIN_DEPOSIT;
-    address public immutable LINK_TOKEN;
-    address public immutable HUB;
-    address public immutable TOKEN_POOL;
-    address public immutable ROUTER;
-    uint64 private hubChainSelector;
-    address private vault;
-
+    uint256 private totalProfitFromHub;
     uint256 private totalDeposits; // total deposited amount made by liquidity providers
-    uint256 private totalAmountSentToVault; // total amount of assets sent to the vault
-    uint256 private totalProfitEarned;
+    // uint256 private totalAmountSentToVault; // total amount of assets sent to the vault
 
     EnumerableSet.AddressSet private allProviders;
 
-    struct liquidityProviderInfo {
+    struct LiquidityProviderInfo {
         address provider;
         uint256 deposit;
         uint256 unclaimedProfit;
@@ -86,59 +117,83 @@ contract SpokeVault is
     }
 
     modifier notZeroAmount(uint256 amount) {
-        require(amount > 0, SpokeVault__AmountMustBeMoreThanZero());
+        if (amount == 0) revert SpokeVault__AmountMustBeMoreThanZero();
         _;
     }
 
     modifier notZeroAddress(address receiver) {
-        require(receiver != address(0), SpokeVault__ZeroAddress());
+        if (receiver == address(0)) revert SpokeVault__ZeroAddress();
         _;
     }
 
     modifier isAllowedProvider(address provider) {
-        require(providers[provider] == true, "Provider not allowed");
+        if (!allowedProviders[provider]) revert("Provider not allowed");
         _;
     }
 
     constructor(
         IERC20 asset,
-        address _vault,
         uint256 minToken,
         address _router,
-        address _hub,
         address _link,
         address _tokenPool
-    )
-        CCIPReceiver(_router)
-        ERC4626(asset)
-        ERC20("Spoke Cross Token", "sCT")
-        Ownable(msg.sender)
-    {
-        vault = _vault;
-        i_MIN_DEPOSIT = minToken * 10 ** decimals();
-        HUB = _hub;
+    ) CCIPReceiver(_router) ERC4626(asset) ERC20("Spoke Cross Token", "sCT") {
+        MIN_DEPOSIT = minToken * 10 ** decimals();
         LINK_TOKEN = _link;
         TOKEN_POOL = _tokenPool;
         ROUTER = _router;
+
+        // Setup roles
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
     }
 
-    function setHubChainSelector(uint64 _chainSelector) external onlyOwner {
-        hubChainSelector = _chainSelector;
+    function setHub(
+        address _hub,
+        uint64 _chainSelector
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        hubVault = HubInfo({
+            hub: _hub,
+            chainSelector: _chainSelector,
+            totalAllocation: 0,
+            totalProfitEarned: 0,
+            lastAllocated: block.timestamp,
+            lastWithdrawal: block.timestamp
+        });
+        // emit
     }
 
     function addLpProvider(
         address _provider
     ) internal notZeroAddress(_provider) {
-        require(!providers[_provider], "Provider already exists");
-        require(allProviders.add(_provider), "Failed to add LP");
-        providers[_provider] = true;
+        if (allowedProviders[_provider]) revert("Provider already exitsts");
+        if (!allProviders.add(_provider))
+            revert("Fail to add Liquidity Provider");
 
-        emit LiquidityProviderAddess(_provider);
+        allowedProviders[_provider] = true;
+        providerInfo[_provider] = LiquidityProviderInfo({
+            provider: _provider,
+            deposit: 0,
+            unclaimedProfit: 0,
+            lastDeposit: block.timestamp,
+            lastWithdrawal: block.timestamp,
+            isActive: true
+        });
+
+        emit LiquidityProviderAdded(_provider);
     }
     function removeLpProvider(
         address _provider
     ) internal notZeroAddress(_provider) {
-        // require(allProviders.add(_provider), "Failed to add LP");
+        LiquidityProviderInfo storage s = providerInfo[_provider];
+        if (s.unclaimedProfit > 0 || s.deposit > 0)
+            revert("Claim Remaining amount");
+
+        delete allowedProviders[_provider];
+        delete providerInfo[_provider];
+
+        emit LiquidityProviderRemoved(_provider);
+
+        // emit event
     }
 
     // lp deposits underlying assets
@@ -155,20 +210,19 @@ contract SpokeVault is
         returns (uint256)
     {
         address lp = msg.sender;
-        if (!providers[lp]) {
-            addLpProvider(lp);
-        }
+        if (!allowedProviders[lp]) addLpProvider(lp);
 
-        require(
-            assets >= i_MIN_DEPOSIT,
-            SpokeVault__AmountLessThanMinDeposit(assets)
-        );
+        if (assets < MIN_DEPOSIT)
+            revert SpokeVault__AmountLessThanMinDeposit(assets);
+
+        // uint256 expectedMint = previewDeposit(assets);
+        // if (expectedMint < shares) revert("Shares minted mismatched");
 
         uint256 shares = super.deposit(assets, receiver);
-        unchecked {
-            providerBalances[lp] += assets;
-            totalDeposits += assets;
-        }
+        LiquidityProviderInfo storage s = providerInfo[lp];
+        totalDeposits += assets;
+        s.deposit += assets;
+        s.lastDeposit = block.timestamp;
 
         emit DepositSuccessfull(lp, assets);
         return shares;
@@ -187,22 +241,19 @@ contract SpokeVault is
         notZeroAddress(receiver)
         returns (uint256)
     {
-        require(
-            previewRedeem(shares) >= i_MIN_DEPOSIT,
-            SpokeVault__AmountLessThanMinDeposit(previewRedeem(shares))
-        );
         address lp = msg.sender;
-        if (!providers[lp]) {
-            addLpProvider(lp);
-        }
-        uint256 assets = super.mint(shares, receiver);
-        unchecked {
-            providerBalances[lp] += assets;
-            totalDeposits += assets;
-        }
+        uint256 assets = previewMint(shares);
+        if (assets < MIN_DEPOSIT)
+            revert SpokeVault__AmountLessThanMinDeposit(assets);
 
-        emit DepositSuccessfull(lp, assets);
-        return assets;
+        uint256 depositedAssets = super.mint(shares, receiver);
+        LiquidityProviderInfo storage s = providerInfo[lp];
+        s.deposit += depositedAssets;
+        totalDeposits += depositedAssets;
+        s.lastDeposit = block.timestamp;
+
+        // emit
+        return depositedAssets;
     }
 
     // lps withdraw underlying assets and burn their shares
@@ -216,24 +267,34 @@ contract SpokeVault is
         nonReentrant
         whenNotPaused
         notZeroAddress(receiver)
+        isAllowedProvider(owner)
         returns (uint256)
     {
-        //
-        require(msg.sender == owner && providers[owner], "Unauthorized");
-        require(totalDeposits > 0, "Not enough amount to withdraw");
-        require(
-            providerBalances[owner] <= assets,
-            "Assets exceeds deposited amount"
-        );
-        // if withdrawing assets than
-        // first settle all the profits earned by this provider
-        // transfer the required number of assets than
-        // if total deposit becomes zero than remove the liquidity provider from the vault.
-        // don't withdraw below the minimum deposit amount if required than transfer all the deposits and remove the provider
+        if (assets > IERC20(asset()).balanceOf(address(this))) {
+            // for now we shall revert with error message of try again later but soon we'll implemente queue withdrawals
+            revert("Spokes funds are busy try again later");
+        }
+        LiquidityProviderInfo storage s = providerInfo[owner];
 
-        uint256 shares = super.withdraw(assets, receiver, owner);
+        if (s.unclaimedProfit > 0) {
+            s.deposit += s.unclaimedProfit;
+            s.unclaimedProfit = 0;
+        }
+        uint256 maxAmountToPay = s.deposit; // total deposit + profits made
+        if (assets > maxAmountToPay)
+            revert("SpokeVault__NotEnoughAssetsToWithdraw");
 
-        //
+        if (assets >= maxAmountToPay) {
+            removeLpProvider(owner);
+            totalDeposits -= maxAmountToPay;
+        } else {
+            s.deposit -= assets;
+            totalDeposits -= assets;
+        }
+        uint256 sharesBurned = super.withdraw(assets, receiver, owner);
+
+        // emit event
+        return sharesBurned;
     }
 
     // lps withdraw underlying assets agains number of shares and burn the shares
@@ -241,64 +302,101 @@ contract SpokeVault is
         uint256 shares,
         address receiver,
         address owner
-    ) public override nonReentrant whenNotPaused returns (uint256) {
+    )
+        public
+        override
+        notZeroAddress(receiver)
+        isAllowedProvider(owner)
+        nonReentrant
+        whenNotPaused
+        returns (uint256)
+    {
         //
+        uint256 assetsToSend = previewRedeem(shares);
+
+        if (assetsToSend > IERC20(asset()).balanceOf(address(this))) {
+            // for now we shall revert with error message of try again later but soon we'll implemente queue withdrawals
+            revert("Spokes funds are busy try again later");
+        }
+
+        LiquidityProviderInfo storage s = providerInfo[owner];
+        // settle profits before withdrawal
+        if (s.unclaimedProfit > 0) {
+            s.deposit += s.unclaimedProfit;
+            s.unclaimedProfit = 0;
+        }
+
+        if (assetsToSend == s.deposit) {
+            removeLpProvider(owner);
+        } else {
+            s.deposit -= assetsToSend;
+        }
+        totalDeposits -= assetsToSend;
+        uint256 assetsSent = super.redeem(shares, receiver, owner);
+
+        // emit
+        return assetsSent;
     }
 
     function whenProfitsReceived() external nonReentrant {}
 
-    // function transferProfit(
-    //     address provider
-    // ) public isAllowedProvider(provider) nonReentrant whenNotPaused {
-    //     require(msg.sender == provider, "Unauthorized");
-    //     require(totalProfitEarned > 0, "Not enough profit to withdraw");
-
-    //     uint256 profitsToPay = getAmountToPay(provider);
-    //     IERC20(asset()).safeTransfer(provider, profitsToPay);
-
-    //     emit ProfitsClaim(provider, profitsToPay);
-    // }
-
     // CROSS-CHAIN -> HUB VAULT
     // calls deposit function on the vault and receives vault shares for assets sent
-    function sendDepositedFunds(
+    // @notice to send funds on chain
+    function sendFundsToHub(
         uint256 _amount
-    ) external nonReentrant onlyOwner {
-        require(totalDeposits > 0, "Not Enough in Deposit");
+    )
+        external
+        notZeroAmount(_amount)
+        nonReentrant
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        if (totalDeposits <= MIN_DEPOSIT || _amount > totalDeposits)
+            revert("Not Enough deposit or amount exceeds total deposits");
 
-        require(
-            _amount <= totalDeposits,
-            "Amount to send exceeds total deposit"
-        );
-        totalDeposits -= _amount;
-        totalAmountSentToVault += _amount;
-
-        IERC20(asset()).approve(vault, _amount);
-        IHubVault(vault).deposit(_amount, vault);
+        unchecked {
+            totalDeposits -= _amount;
+            hubVault.totalAllocation += _amount;
+        }
+        hubVault.lastAllocated = block.timestamp;
+        if (hubVault.chainSelector == block.chainid) {
+            IERC20(asset()).approve(hubVault.hub, 0);
+            IERC20(asset()).approve(hubVault.hub, _amount);
+            IHubVault(hubVault.hub).deposit(_amount, address(this));
+        } else {
+            _sentToHub(uint8(Operations.DEPOSIT), _amount);
+        }
 
         emit DepositsTransferedToVault(_amount);
     }
 
-    function withdrawDepositedFunds(
-        uint256 amount
-    ) public onlyOwner nonReentrant {
-        uint256 initialBalance = IERC20(asset()).balanceOf(address(this));
-        IHubVault(vault).withdraw(amount, address(this), address(this));
+    ////////////////////////////////////////
+    /////////////// INTERNAL //////////////
 
-        require(
-            IERC20(asset()).balanceOf(address(this)) >= amount + initialBalance,
-            "Did not receive amount"
-        );
+    // automation call
+    function distributeProfite() internal {
+        if (totalProfitFromHub == 0) revert("Not Enough Profit Earned yet");
 
-        emit FundsReceived(amount);
-        // call the internal withdraw function receive underlying tokens along with profits accrued and burn shares
+        address[] memory Lps = allProviders.values();
+        uint256 totalDistributed;
+        for (uint16 i = 0; i < Lps.length; i++) {
+            LiquidityProviderInfo storage lp = providerInfo[Lps[i]];
+            uint256 amountToPay = getAmountToPay(lp.deposit);
+            if (!lp.isActive) continue;
+
+            if (amountToPay == 0 || amountToPay < MIN_PROFIT) continue; // not revert as might revert the entire batch
+            lp.unclaimedProfit += amountToPay;
+            totalDistributed += amountToPay;
+        }
+        if (totalDistributed > totalProfitFromHub)
+            revert("Profit distribution exceeds available profit");
+        totalProfitFromHub -= totalDistributed;
+
+        // emit
     }
 
-    ////////////////////////////////////////
-    ////////////////// INTERNAL
-
     function _sentToHub(uint8 opcode, uint256 assets) internal {
-        require(HUB != address(0), "HUB chain not set");
+        if (hubVault.hub != address(0)) revert("HUB chain not set");
 
         Client.EVMTokenAmount[]
             memory tokenAmounts = new Client.EVMTokenAmount[](1);
@@ -311,7 +409,7 @@ contract SpokeVault is
         bytes memory data = abi.encodePacked(opcode, assets, address(this));
 
         Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
-            receiver: abi.encode(HUB),
+            receiver: abi.encode(hubVault.hub),
             data: data,
             tokenAmounts: tokenAmounts,
             extraArgs: Client._argsToBytes(
@@ -320,46 +418,82 @@ contract SpokeVault is
             feeToken: LINK_TOKEN
         });
 
-        // approving token pool to spend the asset
+        // Safely approving token pool to spend the asset
+        IERC20(asset()).approve(TOKEN_POOL, 0);
         IERC20(asset()).approve(TOKEN_POOL, assets);
 
         // Compute fee
-        uint256 fee = IRouterClient(ROUTER).getFee(hubChainSelector, message);
+        uint256 fee = IRouterClient(ROUTER).getFee(
+            hubVault.chainSelector,
+            message
+        );
+        if (fee == 0) revert("Invalid CCIP Fee");
+        IERC20(LINK_TOKEN).approve(address(ROUTER), 0);
         IERC20(LINK_TOKEN).approve(address(ROUTER), fee);
-        IRouterClient(ROUTER).ccipSend(hubChainSelector, message);
+        bytes32 messageId = IRouterClient(ROUTER).ccipSend(
+            hubVault.chainSelector,
+            message
+        );
+
+        emit CCIPMessageSent(
+            messageId,
+            hubVault.hub,
+            hubVault.chainSelector,
+            assets,
+            opcode
+        );
     }
 
     // function _ccipReceive() internal override {}
     function _ccipReceive(
         Client.Any2EVMMessage memory message
-    ) internal view override {
+    ) internal override {
         // Accept messages only from destinated chain selector
-        require(
-            message.sourceChainSelector == hubChainSelector &&
-                abi.decode(message.sender, (address)) == HUB,
-            "INVALID SENDER"
-        );
+        // if (msg.sender != ROUTER) revert SpokeVault__InvalidRouter();
+        if (msg.sender != ROUTER) revert("iNVALID SENDER");
+
+        address decodedSender = abi.decode(message.sender, (address));
+
+        if (
+            message.sourceChainSelector != hubVault.chainSelector ||
+            decodedSender != hubVault.hub
+        ) {
+            // revert SpokeVault__InvalidSource();
+            revert("invalid sender");
+        }
 
         uint256 profitAmount = abi.decode(message.data, (uint256));
-        require(
-            message.destTokenAmounts.length == 1 &&
-                message.destTokenAmounts[0].amount == profitAmount,
-            "Token mismatch"
-        );
+
+        if (
+            message.destTokenAmounts.length != 1 ||
+            message.destTokenAmounts[0].token != address(asset()) ||
+            message.destTokenAmounts[0].amount != profitAmount
+        ) {
+            revert("Tokens MisMatch");
+        }
 
         // process profit => mint shares to LPs
+        totalProfitFromHub += profitAmount;
+
+        // Emit event
+        // emit CCIPMessageReceived(
+        //     message.sourceChainSelector,
+        //     decodedSender,
+        //     opcode,
+        //     profitAmount
+        // );
     }
 
-    function getAmountToPay(address provider) public view returns (uint256) {
-        return (providerBalances[provider] * totalProfitEarned) / totalDeposits;
+    function getAmountToPay(uint256 amountToPay) public view returns (uint256) {
+        return (amountToPay * totalProfitFromHub) / totalDeposits;
     }
 
     // Emergency functions
-    function pause() external onlyOwner {
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
         _pause();
     }
 
-    function unpause() external onlyOwner {
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
         _unpause();
     }
 
