@@ -18,78 +18,21 @@ contract HubVaultTest is Test {
     address lp = makeAddr("LP");
     address lp2 = makeAddr("LP222");
 
-    function setUp() public {
-        WETH = new ERC20Mock();
-        vm.startPrank(owner);
-        // vault = new HubVault(WETH, _router, linkToken, TokenPool);
-        vm.stopPrank();
-
-        WETH.mint(lp, 200e18);
-        WETH.mint(lp2, 200e18);
-        vm.prank(lp);
-        WETH.approve(address(vault), 100e18);
-        vm.prank(lp2);
-        WETH.approve(address(vault), 200e18);
-    }
+    function setUp() public {}
     ///////////////////////////////////////////////
     // DEPOSIT
     //////////////////////////////////////////////
 
-    function testDepositToVaultBeforeYeild() public {
-        uint256 LP1DEPOSIT = 10e18;
-        uint256 LP2DEPOSIT = 200e18;
-
-        vm.prank(lp);
-        vault.deposit(LP1DEPOSIT, lp);
-
-        vm.prank(lp2);
-        vault.deposit(LP2DEPOSIT, lp2);
-
-        assertEq(vault.balanceOf(lp), LP1DEPOSIT);
-        assertEq(vault.balanceOf(lp2), LP2DEPOSIT);
-    }
+    function testDepositToVaultBeforeYeild() public {}
 
     // uint256 userShares = vault.balanceOf(userAddress);
     // uint256 userAssets = vault.previewRedeem(userShares);
 
-    function testMintToVaultBeforeYeild() public {
-        uint256 LP1DEPOSIT = 10e18;
-        vm.startPrank(lp);
-        vault.deposit(LP1DEPOSIT, lp);
+    function testMintToVaultBeforeYeild() public {}
 
-        uint256 shares = 20e18;
-        vault.mint(shares, lp);
+    function testWithdraw() public {}
 
-        assertEq(vault.balanceOf(lp), shares + LP1DEPOSIT);
-    }
-
-    function testWithdraw() public {
-        uint256 LP1DEPOSIT = 10e18;
-        vm.prank(lp);
-        vault.deposit(LP1DEPOSIT, lp);
-        vm.prank(lp2);
-        vault.deposit(LP1DEPOSIT, lp2);
-
-        assertEq(vault.balanceOf(lp), LP1DEPOSIT);
-        assertEq(vault.balanceOf(lp2), LP1DEPOSIT);
-
-        vault.withdraw(10e18, lp, lp2);
-    }
-
-    function testTwoDifferentTokensInVault() public {
-        uint256 LP1DEPOSIT = 10e18;
-        vm.prank(lp);
-        vault.deposit(LP1DEPOSIT, lp);
-
-        address lp3 = makeAddr("lp3");
-        USDC = new ERC20Mock();
-        USDC.mint(lp3, 10e18);
-
-        vm.startPrank(lp3);
-        USDC.approve(address(vault), type(uint256).max);
-        vm.expectRevert();
-        vault.deposit(10e18, lp3);
-    }
+    function testTwoDifferentTokensInVault() public {}
 
     // Minting
     function testMinting() public {

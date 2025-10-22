@@ -5,6 +5,12 @@
       "rev": "065ef85b5fa52bb4583ebad9e51c20a977b64e7a"
     }
   },
+  "lib\\chainlink-local": {
+    "tag": {
+      "name": "v0.2.5-beta.0",
+      "rev": "9fbeafb68cef6adbdd062e96d6f6dbc4cdb27142"
+    }
+  },
   "lib\\forge-std": {
     "tag": {
       "name": "v1.10.0",
