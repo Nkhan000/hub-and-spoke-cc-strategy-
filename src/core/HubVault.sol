@@ -2,6 +2,7 @@
 
 pragma solidity ^0.8.24;
 
+import {Vault} from "./Vault.sol";
 // import {ERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
 // import {IERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 // import {ERC4626} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/extensions/ERC4626.sol";
@@ -20,9 +21,18 @@ pragma solidity ^0.8.24;
  * @notice Receives ERC20 token from liquidity providers and spoke vaults, use the funds in the different strategies to yield profits
  */
 
-contract HubVault {
-    //     function receiveDeposit(address spoke, uint256 weth, uint256 usdc, uint256 depositValueUsd) external onlySpoke;
-    // function sendProfitToSpokes() external onlyStrategy;
-    // function investToStrategy() external onlyOwnerOrAutomation;
-    // function harvestProfit() external onlyAutomation;
+contract HubVault is Vault {
+    constructor(
+        address _weth,
+        address _usdc,
+        address _wethUsdFeed,
+        address _usdcUsdFeed
+    ) Vault(_weth, _usdc, _wethUsdFeed, _usdcUsdFeed) {
+        //
+    }
 }
+
+// function receiveDeposit(address spoke, uint256 weth, uint256 usdc, uint256 depositValueUsd) external onlySpoke;
+// function sendProfitToSpokes() external onlyStrategy;
+// function investToStrategy() external onlyOwnerOrAutomation;
+// function harvestProfit() external onlyAutomation;

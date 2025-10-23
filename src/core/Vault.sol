@@ -33,17 +33,6 @@ contract Vault is ERC20 {
     AggregatorV3Interface public immutable wethUsdFeed; // e.g., Chainlink WETH/USD
     AggregatorV3Interface public immutable usdcUsdFeed; // e.g., Chainlink USDC/USD (often ~1)
 
-    uint256 public MOCK_USD_PRICE_WETH = 2000;
-    // uint256 public MOCK_UDC_PRICE_USDC = 1;
-
-    uint256 public totalWETH; // _____________
-    //                                     +        = TVL
-    uint256 public totalUSDC; // _____________
-    uint256 public totalShares;
-    // uint256 public pricePerShare;
-
-    mapping(address => uint256) public sharePerUser; // tracks shares per user
-
     mapping(address => uint256) public wethBalanceOf;
     mapping(address => uint256) public usdcBalanceOf;
 
@@ -74,6 +63,47 @@ contract Vault is ERC20 {
         wethUsdFeed = AggregatorV3Interface(_wethUsdFeed);
         usdcUsdFeed = AggregatorV3Interface(_usdcUsdFeed);
     }
+
+    function totalVaultValueUsd() public view returns (uint256) {
+        uint256 wethBal = weth.balanceOf(address(this)); // e.g. 5 * 1e18
+        uint256 usdcBal = usdc.balanceOf(address(this)); // e.g. 10_000 * 1e6
+        return
+            _tokenValueUsd(weth, wethUsdFeed, wethBal) +
+            _tokenValueUsd(usdc, usdcUsdFeed, usdcBal);
+    }
+
+    function pricePerShare() external view returns (uint256) {
+        uint256 supply = totalSupply();
+        if (supply == 0) return 0;
+        return (totalVaultValueUsd() * (10 ** 18)) / supply; // returns USD-per-share scaled by 1e18
+    }
+
+    //===============================
+    // EXTERNAL FUNCTIONS
+    //===============================
+    function deposit(uint256 _amountWeth, uint256 _amountUsdc) public virtual {
+        _deposit(_amountWeth, _amountUsdc);
+    }
+
+    function withdraw(
+        uint256 _shares
+    ) public virtual returns (uint256 wethOut, uint256 usdcOut) {
+        (wethOut, usdcOut) = _withdraw(_shares);
+    }
+
+    function tokenValueUsd(IERC20 token, uint256 amount) external view {
+        AggregatorV3Interface feed;
+        if (token == weth) {
+            feed = wethUsdFeed;
+        } else if (token == usdc) {
+            feed = usdcUsdFeed;
+        }
+        _tokenValueUsd(token, feed, amount);
+    }
+
+    //===============================
+    // INTERNAL FUNCTIONS
+    //===============================
 
     function _latestPrice(
         AggregatorV3Interface feed
@@ -111,20 +141,6 @@ contract Vault is ERC20 {
         // (1e18 * 2e11 * 1e18)/(1e18 * 1e8)=2e21 → $2000 * 1e18 units.
     }
 
-    function totalVaultValueUsd() public view returns (uint256) {
-        uint256 wethBal = weth.balanceOf(address(this)); // e.g. 5 * 1e18
-        uint256 usdcBal = usdc.balanceOf(address(this)); // e.g. 10_000 * 1e6
-        return
-            _tokenValueUsd(weth, wethUsdFeed, wethBal) +
-            _tokenValueUsd(usdc, usdcUsdFeed, usdcBal);
-    }
-
-    function pricePerShare() external view returns (uint256) {
-        uint256 supply = totalSupply();
-        if (supply == 0) return 0;
-        return (totalVaultValueUsd() * (10 ** 18)) / supply; // returns USD-per-share scaled by 1e18
-    }
-
     function _deposit(uint256 _amountWeth, uint256 _amountUsdc) internal {
         require(_amountWeth > 0 || _amountUsdc > 0, "Nothing to deposit");
         //
@@ -141,7 +157,7 @@ contract Vault is ERC20 {
         uint256 totalDepositValueUsd = _tokenValueUsd(
             weth,
             wethUsdFeed,
-            _amountUsdc
+            _amountWeth
         ) + _tokenValueUsd(usdc, usdcUsdFeed, _amountUsdc);
 
         require(totalDepositValueUsd > 0, "zero deposit value");
@@ -149,7 +165,7 @@ contract Vault is ERC20 {
         uint256 vaultValueAfterDeposit = totalVaultValueUsd();
 
         require(
-            vaultValueBeforeDeposit + totalDepositValueUsd ==
+            vaultValueBeforeDeposit + totalDepositValueUsd >=
                 vaultValueAfterDeposit
         );
 
