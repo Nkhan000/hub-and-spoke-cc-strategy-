@@ -21,6 +21,7 @@ interface AggregatorV3Interface {
             uint256 updatedAt,
             uint80 answeredInRound
         );
+
     function decimals() external view returns (uint8);
 }
 
@@ -81,8 +82,11 @@ contract Vault is ERC20 {
     //===============================
     // EXTERNAL FUNCTIONS
     //===============================
-    function deposit(uint256 _amountWeth, uint256 _amountUsdc) public virtual {
-        _deposit(_amountWeth, _amountUsdc);
+    function deposit(
+        uint256 _amountWeth,
+        uint256 _amountUsdc
+    ) public virtual returns (uint256) {
+        return _deposit(_amountWeth, _amountUsdc);
     }
 
     function withdraw(
@@ -91,15 +95,25 @@ contract Vault is ERC20 {
         (wethOut, usdcOut) = _withdraw(_shares);
     }
 
-    function tokenValueUsd(IERC20 token, uint256 amount) external view {
+    function tokenValueUsd(
+        IERC20 token,
+        uint256 amount
+    ) public view returns (uint256) {
         AggregatorV3Interface feed;
         if (token == weth) {
             feed = wethUsdFeed;
         } else if (token == usdc) {
             feed = usdcUsdFeed;
         }
-        _tokenValueUsd(token, feed, amount);
+        return _tokenValueUsd(token, feed, amount);
     }
+
+    // function getWethBalanceUsd(address sender) public view returns (uint256) {
+    //     return tokenValueUsd(weth, weth.balanceOf(sender));
+    // }
+    // function getUsdcBalanceUsd(address sender) public view returns (uint256) {
+    //     return tokenValueUsd(usdc, usdc.balanceOf(sender));
+    // }
 
     //===============================
     // INTERNAL FUNCTIONS
@@ -141,7 +155,10 @@ contract Vault is ERC20 {
         // (1e18 * 2e11 * 1e18)/(1e18 * 1e8)=2e21 → $2000 * 1e18 units.
     }
 
-    function _deposit(uint256 _amountWeth, uint256 _amountUsdc) internal {
+    function _deposit(
+        uint256 _amountWeth,
+        uint256 _amountUsdc
+    ) internal returns (uint256) {
         require(_amountWeth > 0 || _amountUsdc > 0, "Nothing to deposit");
         //
         uint256 supply = totalSupply();
@@ -152,6 +169,9 @@ contract Vault is ERC20 {
             weth.safeTransferFrom(msg.sender, address(this), _amountWeth);
         if (_amountUsdc > 0)
             usdc.safeTransferFrom(msg.sender, address(this), _amountUsdc);
+
+        wethBalanceOf[msg.sender] += _amountWeth;
+        usdcBalanceOf[msg.sender] += _amountUsdc;
 
         // compute deposit USD value (18-decimals)
         uint256 totalDepositValueUsd = _tokenValueUsd(
@@ -190,6 +210,8 @@ contract Vault is ERC20 {
             _amountUsdc,
             totalDepositValueUsd
         );
+
+        return sharesMinted;
     }
 
     function _withdraw(
@@ -214,6 +236,9 @@ contract Vault is ERC20 {
 
         // burn shares first to avoid reentrancy edgecases in accounting
         _burn(msg.sender, _shares);
+
+        wethBalanceOf[msg.sender] -= wethOut;
+        usdcBalanceOf[msg.sender] -= usdcOut;
 
         // transfers
         if (wethOut > 0) weth.safeTransfer(msg.sender, wethOut);
