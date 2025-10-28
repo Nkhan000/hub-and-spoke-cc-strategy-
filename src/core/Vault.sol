@@ -4,38 +4,48 @@ pragma solidity ^0.8.0;
 import {ERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import {OracleLib, AggregatorV3Interface} from "../libraries/OracleLib.sol";
+import {EnumerableSet} from "../../lib/openzeppelin-contracts/contracts/utils/structs/EnumerableSet.sol";
 
 /// @title A multi token vault
 /// @author Nazir Khan
-/// @notice Handles multiple tokens (2-3) tokens sent by a liquidity provider from native and cross chain transfers
+/// @notice Handles multiple tokens (2-3) tokens sent by a liquidity provider.
 /// @dev
 
-interface AggregatorV3Interface {
-    function latestRoundData()
-        external
-        view
-        returns (
-            uint80 roundId,
-            int256 answer,
-            uint256 startedAt,
-            uint256 updatedAt,
-            uint80 answeredInRound
-        );
+// interface AggregatorV3Interface {
+//     function latestRoundData()
+//         external
+//         view
+//         returns (
+//             uint80 roundId,
+//             int256 answer,
+//             uint256 startedAt,
+//             uint256 updatedAt,
+//             uint80 answeredInRound
+//         );
 
-    function decimals() external view returns (uint8);
-}
+//     function decimals() external view returns (uint8);
+// }
 
-contract Vault is ERC20 {
+abstract contract Vault is ERC20 {
     using SafeERC20 for IERC20;
+    using OracleLib for AggregatorV3Interface;
+    using EnumerableSet for EnumerableSet.AddressSet;
 
-    IERC20 public immutable weth;
-    IERC20 public immutable usdc;
+    //   Chainlink WETH/USD
+    //   Chainlink USDC/USD (often ~1)
 
-    AggregatorV3Interface public immutable wethUsdFeed; // e.g., Chainlink WETH/USD
-    AggregatorV3Interface public immutable usdcUsdFeed; // e.g., Chainlink USDC/USD (often ~1)
+    uint256 public constant MAX_ALLOWED_TOKENS = 4;
+    mapping(address => TokenInfo) public tokens;
 
-    mapping(address => uint256) public wethBalanceOf;
-    mapping(address => uint256) public usdcBalanceOf;
+    EnumerableSet.AddressSet private supportedTokens;
+    mapping(address => mapping(address => uint256)) public userTokens;
+
+    struct TokenInfo {
+        IERC20 token;
+        AggregatorV3Interface priceFeed;
+        bool supported;
+    }
 
     event Deposit(
         address indexed user,
@@ -53,24 +63,45 @@ contract Vault is ERC20 {
     );
 
     constructor(
-        address _weth,
-        address _usdc,
-        address _wethUsdFeed,
-        address _usdcUsdFeed
+        address[] memory _tokens,
+        address[] memory _priceFeeds
     ) ERC20("Vault Share", "vSHARE") {
-        require(_weth != address(0) && _usdc != address(0), "zero addr");
-        weth = IERC20(_weth);
-        usdc = IERC20(_usdc);
-        wethUsdFeed = AggregatorV3Interface(_wethUsdFeed);
-        usdcUsdFeed = AggregatorV3Interface(_usdcUsdFeed);
+        require(_tokens.length == _priceFeeds.length, "Length mismatch");
+        for (uint256 i = 0; i < _tokens.length; i++) {
+            address token = _tokens[i];
+            address feed = _priceFeeds[i];
+            require(token != address(0) && feed != address(0), "Zero address");
+            tokens[token] = TokenInfo({
+                token: IERC20(token),
+                priceFeed: AggregatorV3Interface(feed),
+                supported: true
+            });
+            supportedTokens.add(token);
+        }
     }
 
     function totalVaultValueUsd() public view returns (uint256) {
-        uint256 wethBal = weth.balanceOf(address(this)); // e.g. 5 * 1e18
-        uint256 usdcBal = usdc.balanceOf(address(this)); // e.g. 10_000 * 1e6
-        return
-            _tokenValueUsd(weth, wethUsdFeed, wethBal) +
-            _tokenValueUsd(usdc, usdcUsdFeed, usdcBal);
+        // uint256 wethBal = weth.balanceOf(address(this)); // e.g. 5 * 1e18
+        // uint256 usdcBal = usdc.balanceOf(address(this)); // e.g. 10_000 * 1e6
+        // return
+        //     _tokenValueUsd(weth, wethUsdFeed, wethBal) +
+        //     _tokenValueUsd(usdc, usdcUsdFeed, usdcBal);
+
+        uint256 totalVaultVal;
+
+        for (uint16 i = 0; i < supportedTokens.length(); i++) {
+            address token = supportedTokens.at(i);
+            TokenInfo storage info = tokens[token];
+            uint256 tokenBalance = info.token.balanceOf(address(this));
+            uint256 tokenUsdBalance = _tokenValueUsd(
+                IERC20(token),
+                info.priceFeed,
+                tokenBalance
+            );
+            totalVaultVal += tokenUsdBalance;
+        }
+
+        return totalVaultVal;
     }
 
     function pricePerShare() external view returns (uint256) {
@@ -83,37 +114,25 @@ contract Vault is ERC20 {
     // EXTERNAL FUNCTIONS
     //===============================
     function deposit(
-        uint256 _amountWeth,
-        uint256 _amountUsdc
-    ) public virtual returns (uint256) {
-        return _deposit(_amountWeth, _amountUsdc);
+        address[] memory _tokensAddresses,
+        uint256[] memory _amounts
+    ) public virtual returns (uint256, uint256) {
+        return _deposit(_tokensAddresses, _amounts);
     }
 
     function withdraw(
         uint256 _shares
-    ) public virtual returns (uint256 wethOut, uint256 usdcOut) {
-        (wethOut, usdcOut) = _withdraw(_shares);
+    ) public virtual returns (uint256 withdrawValueInUsd) {
+        withdrawValueInUsd = _withdraw(_shares);
     }
 
     function tokenValueUsd(
         IERC20 token,
         uint256 amount
     ) public view returns (uint256) {
-        AggregatorV3Interface feed;
-        if (token == weth) {
-            feed = wethUsdFeed;
-        } else if (token == usdc) {
-            feed = usdcUsdFeed;
-        }
+        AggregatorV3Interface feed = tokens[address(token)].priceFeed;
         return _tokenValueUsd(token, feed, amount);
     }
-
-    // function getWethBalanceUsd(address sender) public view returns (uint256) {
-    //     return tokenValueUsd(weth, weth.balanceOf(sender));
-    // }
-    // function getUsdcBalanceUsd(address sender) public view returns (uint256) {
-    //     return tokenValueUsd(usdc, usdc.balanceOf(sender));
-    // }
 
     //===============================
     // INTERNAL FUNCTIONS
@@ -121,11 +140,13 @@ contract Vault is ERC20 {
 
     function _latestPrice(
         AggregatorV3Interface feed
-    ) internal view returns (uint256 price, uint8 feedDecimals) {
-        (, int256 answer, , , ) = feed.latestRoundData();
-        require(answer > 0, "Invalid price");
-        feedDecimals = feed.decimals();
-        price = uint256(answer);
+    ) internal view returns (uint256, uint8) {
+        (, int256 answer, , , ) = feed.staleCheckLatestRoundData();
+        if (answer == 0) revert("Vault__InvalidPrice");
+
+        uint8 feedDecimals = feed.decimals();
+        uint256 price = uint256(answer);
+        return (price, feedDecimals);
     }
 
     function _tokenValueUsd(
@@ -155,39 +176,46 @@ contract Vault is ERC20 {
         // (1e18 * 2e11 * 1e18)/(1e18 * 1e8)=2e21 → $2000 * 1e18 units.
     }
 
+    // @ TODO : ADD REENTRANCY GUARD IS NEEDED OR NOT ?
     function _deposit(
-        uint256 _amountWeth,
-        uint256 _amountUsdc
-    ) internal returns (uint256) {
-        require(_amountWeth > 0 || _amountUsdc > 0, "Nothing to deposit");
-        //
+        address[] memory _tokensAddresses,
+        uint256[] memory _amounts
+    ) internal returns (uint256, uint256) {
+        require(_tokensAddresses.length == _amounts.length, "Length mismatch");
+        require(
+            _tokensAddresses.length < MAX_ALLOWED_TOKENS,
+            "Exceeds Maximum numbers of tokens"
+        );
+
         uint256 supply = totalSupply();
         uint256 vaultValueBeforeDeposit = totalVaultValueUsd();
 
-        // transfer tokens in first (prevents griefing)
-        if (_amountWeth > 0)
-            weth.safeTransferFrom(msg.sender, address(this), _amountWeth);
-        if (_amountUsdc > 0)
-            usdc.safeTransferFrom(msg.sender, address(this), _amountUsdc);
+        uint256 totalDepositValueUsd;
 
-        wethBalanceOf[msg.sender] += _amountWeth;
-        usdcBalanceOf[msg.sender] += _amountUsdc;
+        for (uint256 i = 0; i < _tokensAddresses.length; i++) {
+            address tokenAddr = _tokensAddresses[i];
+            uint256 amount = _amounts[i];
+            if (amount == 0) continue;
 
-        // compute deposit USD value (18-decimals)
-        uint256 totalDepositValueUsd = _tokenValueUsd(
-            weth,
-            wethUsdFeed,
-            _amountWeth
-        ) + _tokenValueUsd(usdc, usdcUsdFeed, _amountUsdc);
+            // check if the token is supported or not
+            require(isSupported(tokenAddr), "Token Not Supported");
 
-        require(totalDepositValueUsd > 0, "zero deposit value");
+            TokenInfo storage s = tokens[tokenAddr];
+            // Transfer tokens to this vault from the sender
+            s.token.safeTransferFrom(msg.sender, address(this), amount);
+
+            // updating deposited tokens
+            userTokens[msg.sender][tokenAddr] += amount;
+
+            // compute deposit USD value (18-decimals)
+            totalDepositValueUsd += _tokenValueUsd(
+                s.token,
+                s.priceFeed,
+                amount
+            );
+        }
 
         uint256 vaultValueAfterDeposit = totalVaultValueUsd();
-
-        require(
-            vaultValueBeforeDeposit + totalDepositValueUsd >=
-                vaultValueAfterDeposit
-        );
 
         uint256 sharesMinted;
         if (supply == 0) {
@@ -199,24 +227,16 @@ contract Vault is ERC20 {
                 (totalDepositValueUsd * supply) /
                 vaultValueBeforeDeposit;
         }
-
-        require(sharesMinted > 0, "Zero shares minted");
-        _mint(msg.sender, sharesMinted);
-
-        emit Deposit(
-            msg.sender,
-            sharesMinted,
-            _amountWeth,
-            _amountUsdc,
-            totalDepositValueUsd
+        require(
+            (vaultValueAfterDeposit - vaultValueBeforeDeposit) ==
+                totalDepositValueUsd
         );
-
-        return sharesMinted;
+        _mint(msg.sender, sharesMinted);
+        // emit
+        return (sharesMinted, totalDepositValueUsd);
     }
 
-    function _withdraw(
-        uint256 _shares
-    ) internal returns (uint256 wethOut, uint256 usdcOut) {
+    function _withdraw(uint256 _shares) internal returns (uint256) {
         require(
             _shares > 0 && _shares <= balanceOf(msg.sender),
             "Invalid shares"
@@ -224,32 +244,52 @@ contract Vault is ERC20 {
 
         uint256 supply = totalSupply();
         if (supply == 0) revert("No shares to burn");
-
-        uint256 wethAmt = weth.balanceOf(address(this));
-        uint256 usdcAmt = usdc.balanceOf(address(this));
-
-        // proportional amounts to send
-        wethOut = (wethAmt * _shares) / supply;
-        usdcOut = (usdcAmt * _shares) / supply;
-
         uint256 vaultValaueBeforeWithdraw = totalVaultValueUsd();
 
-        // burn shares first to avoid reentrancy edgecases in accounting
         _burn(msg.sender, _shares);
 
-        wethBalanceOf[msg.sender] -= wethOut;
-        usdcBalanceOf[msg.sender] -= usdcOut;
+        uint256 withdrawUsdValue;
 
-        // transfers
-        if (wethOut > 0) weth.safeTransfer(msg.sender, wethOut);
-        if (usdcOut > 0) usdc.safeTransfer(msg.sender, usdcOut);
+        for (uint16 i = 0; i < supportedTokens.length(); i++) {
+            address tokenAddr = supportedTokens.at(i);
+            TokenInfo storage info = tokens[tokenAddr];
+            uint256 vaultBal = info.token.balanceOf(address(this));
 
-        uint256 valueUsd = _tokenValueUsd(weth, wethUsdFeed, wethOut) +
-            _tokenValueUsd(usdc, usdcUsdFeed, usdcOut);
+            // proportional amount burning
+            uint256 amountOut = (vaultBal * _shares) / supply;
+            if (amountOut == 0) continue;
 
-        require(totalVaultValueUsd() == vaultValaueBeforeWithdraw - valueUsd);
+            uint256 userBalOfToken = userTokens[msg.sender][tokenAddr];
 
-        emit Withdraw(msg.sender, _shares, wethOut, usdcOut, valueUsd);
+            if (userBalOfToken < amountOut) {
+                amountOut = userBalOfToken; // Prevent over-withdraw
+            }
+
+            withdrawUsdValue += _tokenValueUsd(
+                info.token,
+                info.priceFeed,
+                amountOut
+            );
+
+            userTokens[msg.sender][tokenAddr] -= amountOut;
+
+            info.token.safeTransfer(msg.sender, amountOut);
+        }
+
+        require(
+            totalVaultValueUsd() == vaultValaueBeforeWithdraw - withdrawUsdValue
+        );
+
+        return withdrawUsdValue;
+        // return total
+        // emit Withdraw(msg.sender, _shares, wethOut, usdcOut, valueUsd);
+    }
+
+    // ===========================
+    // GETTERS
+    // ===========================
+    function isSupported(address _token) public view returns (bool) {
+        return tokens[_token].supported;
     }
 }
 

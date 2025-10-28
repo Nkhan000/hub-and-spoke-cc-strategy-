@@ -9,11 +9,14 @@ import {Vault} from "./Vault.sol";
 
 // import {IStrategy} from "../strategies/IStrategy.sol";
 // import {EnumerableSet} from "../../lib/openzeppelin-contracts/contracts/utils/structs/EnumerableSet.sol";
+import {OracleLib, AggregatorV3Interface} from "../libraries/OracleLib.sol";
+// import {AutomationCompatibleInterface} from "../../lib/chainlink-evm/contracts/src/v0.8/automation/AutomationCompatible.sol";
 
 import {AccessControl} from "../../lib/openzeppelin-contracts/contracts/access/AccessControl.sol";
 import {ReentrancyGuard} from "../../lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "../../lib/openzeppelin-contracts/contracts/utils/Pausable.sol";
-import {SafeERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+
+// import {SafeERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /**
  * @title HubVault
@@ -21,13 +24,14 @@ import {SafeERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/
  * @notice Receives ERC20 token from liquidity providers and spoke vaults, use the funds in the different strategies to yield profits
  */
 
-interface ISpoke {
+// interface ISpoke {
 
-}
+// }
 
 // TODO : Aggregator and chainlink oracle
 
 contract HubVault is Vault, AccessControl, ReentrancyGuard, Pausable {
+    using OracleLib for AggregatorV3Interface;
     //===================================
     // ERRORS
     //===================================
@@ -38,6 +42,7 @@ contract HubVault is Vault, AccessControl, ReentrancyGuard, Pausable {
     error HubVault__SpokeAlreadyExists();
     error HubVault__SpokeDoesNotExists();
     error HubVault__InvalidSender();
+    error HubVault__BurnSharesFirst();
 
     //===================================
     // ROLES
@@ -85,6 +90,8 @@ contract HubVault is Vault, AccessControl, ReentrancyGuard, Pausable {
         uint256 shares
     );
 
+    event WithdrawSuccessfull(uint256 withdrawAmt, uint256 sharesBurnt);
+
     /// @dev Required to resolve multiple inheritance of supportsInterface
     // function supportsInterface(
     //     bytes4 interfaceId
@@ -93,19 +100,9 @@ contract HubVault is Vault, AccessControl, ReentrancyGuard, Pausable {
     // }
 
     constructor(
-        address _weth,
-        address _usdc,
-        address _wethUsdFeed,
-        address _usdcUsdFeed
-    ) Vault(_weth, _usdc, _wethUsdFeed, _usdcUsdFeed) {
-        //
-        require(
-            _weth != address(0) ||
-                _usdc != address(0) ||
-                _wethUsdFeed != address(0) ||
-                _usdcUsdFeed != address(0),
-            HubVault__InvalidAddress()
-        );
+        address[] memory _tokens,
+        address[] memory _priceFeeds
+    ) Vault(_tokens, _priceFeeds) {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ALLOCATOR_ROLE, msg.sender);
         // _grantRole(SPOKE_ROLE, address(spoke));
@@ -151,9 +148,12 @@ contract HubVault is Vault, AccessControl, ReentrancyGuard, Pausable {
         if (_spoke == address(0)) revert HubVault__InvalidAddress();
         if (spokeInfo[_spoke].spokeAddress == address(0))
             revert HubVault__SpokeDoesNotExists(); // spoke already exists maybe a better error message would do
-        // SpokeInfo
+
         // BEFORE DELETING SEND BACK THE FUNDS TO THIS SPOKE
-        // if()
+        if (
+            spokeInfo[_spoke].shares > 0 ||
+            spokeInfo[_spoke].unclaimedProfit > 0
+        ) revert HubVault__BurnSharesFirst();
 
         // DELETE THE SPOKE FROM THE MAPPING
         delete spokeInfo[_spoke];
@@ -163,39 +163,47 @@ contract HubVault is Vault, AccessControl, ReentrancyGuard, Pausable {
     }
 
     function deposit(
-        uint256 _amountWeth,
-        uint256 _amountUsdc
-    ) public override onlyRole(SPOKE_ROLE) returns (uint256) {
+        address[] memory _tokensAddresses,
+        uint256[] memory _amounts
+    ) public override onlyRole(SPOKE_ROLE) returns (uint256, uint256) {
         address sender = msg.sender;
         if (sender != spokeInfo[sender].spokeAddress)
             revert HubVault__InvalidSender();
 
-        uint256 shares = _deposit(_amountWeth, _amountUsdc);
-        uint256 totalDeposits = tokenValueUsd(weth, _amountWeth) +
-            tokenValueUsd(usdc, _amountUsdc);
+        (uint256 shares, uint256 totalDepositsInUsd) = _deposit(
+            _tokensAddresses,
+            _amounts
+        );
 
         SpokeInfo storage s = spokeInfo[sender];
         s.shares += shares;
-        s.deposits += totalDeposits;
+        s.deposits += totalDepositsInUsd;
         s.lastDeposit = block.timestamp;
 
-        emit DepositSuccessfull(_amountUsdc, _amountWeth, shares);
-        return shares;
+        // emit DepositSuccessfull(_amountUsdc, _amountWeth, shares);
+        return (shares, totalDepositsInUsd);
     }
 
     function withdraw(
-        uint256 shares
-    )
-        public
-        override
-        onlyRole(SPOKE_ROLE)
-        returns (uint256 wethOut, uint256 usdcOut)
-    {
-        //
+        uint256 _shares
+    ) public override onlyRole(SPOKE_ROLE) nonReentrant returns (uint256) {
+        address sender = msg.sender;
+        if (sender != spokeInfo[sender].spokeAddress)
+            revert HubVault__InvalidSender();
+
+        uint256 withdrawAmt = _withdraw(_shares);
+
+        SpokeInfo storage s = spokeInfo[msg.sender];
+        s.shares -= _shares;
+        s.deposits -= withdrawAmt;
+        s.lastWithdrawal = block.timestamp;
+
+        emit WithdrawSuccessfull(withdrawAmt, _shares);
+        return withdrawAmt;
     }
 
     // ============================================
-    // INTERNAL
+    // EXTERNAL / PUBLIC
     // ============================================
     function grantRole(
         bytes32 role,
@@ -203,6 +211,28 @@ contract HubVault is Vault, AccessControl, ReentrancyGuard, Pausable {
     ) public override onlyRole(DEFAULT_ADMIN_ROLE) {
         _grantRole(role, account);
         // EMIT
+    }
+
+    // ============================================
+    // INTERNAL
+    // ============================================
+
+    // ============================================
+    // GETTERS
+    // ============================================
+    function getShares(address _spoke) external view returns (uint256) {
+        uint256 shares = spokeInfo[_spoke].shares;
+        require(shares == balanceOf(_spoke), "Inconsistent Shares");
+        return shares;
+    }
+
+    // Emergency functions
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
     }
 }
 

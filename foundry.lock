@@ -5,6 +5,12 @@
       "rev": "065ef85b5fa52bb4583ebad9e51c20a977b64e7a"
     }
   },
+  "lib\\chainlink-evm": {
+    "tag": {
+      "name": "v0.3.3",
+      "rev": "793106cd598da8b2762958880300787b0b361fa1"
+    }
+  },
   "lib\\chainlink-local": {
     "tag": {
       "name": "v0.2.5-beta.0",
