@@ -292,9 +292,9 @@ abstract contract Vault is ERC20 {
     function getSupportedTokens()
         public
         view
-        returns (address[] memory tokens)
+        returns (address[] memory tokensAddresses)
     {
-        return tokens = supportedTokens.values();
+        tokensAddresses = supportedTokens.values();
     }
 
     function getAllShares(address _user) public view returns (uint256) {
