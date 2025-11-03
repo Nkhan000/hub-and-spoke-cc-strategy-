@@ -1,8 +1,9 @@
 // SPDX-License-Identifer: MIT
 pragma solidity ^0.8.24;
 
-import {Test} from "lib/forge-std/src/Test.sol";
+import {Test, console2} from "lib/forge-std/src/Test.sol";
 import {HubVault} from "src/core/HubVault.sol";
+import {Vault} from "src/core/Vault.sol";
 import {MockV3Aggregator} from "../../lib/chainlink-evm/contracts/src/v0.8/shared/mocks/MockV3Aggregator.sol";
 import {ERC20Mock} from "src/mocks/ERC20Mock.sol";
 
@@ -14,44 +15,58 @@ contract HubVaultTest is Test {
     HubVault public hubVault;
     ERC20Mock public weth;
     ERC20Mock public usdc;
+    ERC20Mock public wbtc;
     MockV3Aggregator public wethUsdFeed;
     MockV3Aggregator public usdcUsdFeed;
+    MockV3Aggregator public wbtcUsdFeed;
 
     address[] public tokenAddresses;
     address[] public priceFeeds;
 
+    uint256 public constant INITIIAL_SUPPLY = 100e18;
+
     function setUp() public {
         weth = new ERC20Mock("Wrapped ETH", "wEth", 18);
         usdc = new ERC20Mock("USD Coin", "usdc", 6);
+        wbtc = new ERC20Mock("Wrapped Bitcoin", "wBtc", 8);
 
         wethUsdFeed = new MockV3Aggregator(8, 2000e8); // 8 decimals, $2000
         usdcUsdFeed = new MockV3Aggregator(8, 1e8); // 8 decimals, $1
+        wbtcUsdFeed = new MockV3Aggregator(8, 100_000e8); // 8 decimals, $100_00
 
         tokenAddresses.push(address(weth));
         tokenAddresses.push(address(usdc));
+        tokenAddresses.push(address(wbtc));
 
         priceFeeds.push(address(wethUsdFeed));
         priceFeeds.push(address(usdcUsdFeed));
+        priceFeeds.push(address(wbtcUsdFeed));
 
+        vm.startPrank(owner);
         hubVault = new HubVault(tokenAddresses, priceFeeds);
 
         // add spokes and gives them access
         hubVault.addSpoke(userA);
+        vm.stopPrank();
 
-        weth.mint(userA, 10 ether);
-        usdc.mint(userA, 20_000e6);
+        weth.mint(userA, 5 ether);
+        usdc.mint(userA, 5_000e6);
+        wbtc.mint(userA, 1e8);
 
         vm.startPrank(userA);
         weth.approve(address(hubVault), type(uint256).max);
         usdc.approve(address(hubVault), type(uint256).max);
+        wbtc.approve(address(hubVault), type(uint256).max);
         vm.stopPrank();
 
-        weth.mint(userB, 10 ether);
-        usdc.mint(userB, 20_000e6);
+        weth.mint(userB, 5 ether);
+        usdc.mint(userB, 5_000e6);
+        wbtc.mint(userB, 1e8);
 
         vm.startPrank(userB);
         weth.approve(address(hubVault), type(uint256).max);
         usdc.approve(address(hubVault), type(uint256).max);
+        wbtc.approve(address(hubVault), type(uint256).max);
         vm.stopPrank();
     }
 
@@ -75,7 +90,7 @@ contract HubVaultTest is Test {
 
         uint256 sharesAfterDeposit = hubVault.totalSupply();
         assert(sharesAfterDeposit > initialShares);
-        assertEq(sharesAfterDeposit, 20_000e18);
+        assertEq(sharesAfterDeposit, INITIIAL_SUPPLY);
     }
 
     function testNotAllowedSpoke() public {
@@ -114,6 +129,102 @@ contract HubVaultTest is Test {
         vm.expectRevert();
         vm.prank(userA);
         hubVault.deposit(tokensArr, amountsArr);
+    }
+
+    function testMultiUsersDeposit() public {
+        (uint256 sharesA, ) = _depositForUser(5 ether, 5_000e6, 0, userA);
+
+        vm.prank(owner);
+        hubVault.addSpoke(userB);
+
+        (uint256 sharesB, ) = _depositForUser(4 ether, 4_000e6, 1e8, userB);
+
+        assertEq(sharesA, INITIIAL_SUPPLY);
+        assertEq(sharesA, hubVault.getShares(userA));
+
+        assertEq(sharesB, hubVault.totalSupply() - sharesA);
+        assertEq(sharesB, hubVault.getShares(userB));
+    }
+
+    // =================================
+    // WITHDRAW
+    // =================================
+
+    function testMultiUsersWithdraw() public {
+        uint256 totalUserABalanceBeforeDeposit = _totalBalanceOfUserInUsd(
+            userA
+        );
+        uint256 totalUserBBalanceBeforeDeposit = _totalBalanceOfUserInUsd(
+            userB
+        );
+        _depositForUser(5 ether, 5_000e6, 0, userA);
+
+        vm.prank(owner);
+        hubVault.addSpoke(userB);
+
+        _depositForUser(4 ether, 4_000e6, 1e8, userB);
+
+        uint256 allSharesOfA = hubVault.getShares(userA);
+
+        vm.prank(userA);
+        uint256 withdrawAmtA = hubVault.withdraw(allSharesOfA);
+
+        uint256 totalUserABalanceAfterWithdraw = _totalBalanceOfUserInUsd(
+            userA
+        );
+
+        assertApproxEqAbs(
+            totalUserABalanceAfterWithdraw,
+            totalUserABalanceBeforeDeposit,
+            1e15
+        );
+
+        uint256 allSharesOfB = hubVault.getShares(userB);
+
+        vm.prank(userB);
+        uint256 withdrawAmtB = hubVault.withdraw(allSharesOfB); // 100 units of shares
+
+        uint256 totalUserBBalanceAfterWithdraw = _totalBalanceOfUserInUsd(
+            userB
+        );
+
+        assertApproxEqAbs(
+            totalUserBBalanceAfterWithdraw,
+            totalUserBBalanceBeforeDeposit,
+            1e15
+        );
+    }
+
+    function _totalBalanceOfUserInUsd(address user) public returns (uint256) {
+        return
+            hubVault.tokenValueUsd(weth, weth.balanceOf(user)) +
+            hubVault.tokenValueUsd(usdc, usdc.balanceOf(user)) +
+            hubVault.tokenValueUsd(wbtc, wbtc.balanceOf(user));
+    }
+
+    function _depositForUser(
+        uint256 _wethAmt,
+        uint256 _usdcAmt,
+        uint256 _wbtcAmt,
+        address _user
+    ) public returns (uint256, uint256) {
+        address[] memory tokensArr = new address[](3);
+        uint256[] memory amountsArr = new uint256[](3);
+
+        tokensArr[0] = address(weth);
+        tokensArr[1] = address(usdc);
+        tokensArr[2] = address(wbtc);
+
+        amountsArr[0] = _wethAmt;
+        amountsArr[1] = _usdcAmt;
+        amountsArr[2] = _wbtcAmt;
+
+        vm.prank(_user); // not allowed spoke
+        (uint256 shares, uint256 totalDepositedValue) = hubVault.deposit(
+            tokensArr,
+            amountsArr
+        );
+        return (shares, totalDepositedValue);
     }
 
     // function testHubDeposit() public {

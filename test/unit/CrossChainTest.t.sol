@@ -4,7 +4,7 @@ pragma solidity ^0.8.0;
 
 import {Test, console2} from "lib/forge-std/src/Test.sol";
 import {HubVault} from "../../src/core/HubVault.sol";
-import {CCIPLocalSimulatorFork, Register} from "lib/chainlink-local/src/ccip/CCIPLocalSimulatorFork.sol";
+// import {CCIPLocalSimulatorFork, Register} from "lib/chainlink-local/src/ccip/CCIPLocalSimulatorFork.sol";
 import {SpokeVault} from "../../src/core/SpokeVault.sol";
 import {ERC20Mock} from "../../lib/openzeppelin-contracts/contracts/mocks/token/ERC20Mock.sol";
 

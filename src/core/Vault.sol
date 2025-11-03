@@ -6,26 +6,11 @@ import {IERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/IER
 import {SafeERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {OracleLib, AggregatorV3Interface} from "../libraries/OracleLib.sol";
 import {EnumerableSet} from "../../lib/openzeppelin-contracts/contracts/utils/structs/EnumerableSet.sol";
+import {Math} from "../../lib/openzeppelin-contracts/contracts/utils/math/Math.sol";
 
 /// @title A multi token vault
 /// @author Nazir Khan
 /// @notice Handles multiple tokens (2-3) tokens sent by a liquidity provider.
-/// @dev
-
-// interface AggregatorV3Interface {
-//     function latestRoundData()
-//         external
-//         view
-//         returns (
-//             uint80 roundId,
-//             int256 answer,
-//             uint256 startedAt,
-//             uint256 updatedAt,
-//             uint80 answeredInRound
-//         );
-
-//     function decimals() external view returns (uint8);
-// }
 
 abstract contract Vault is ERC20 {
     using SafeERC20 for IERC20;
@@ -36,10 +21,11 @@ abstract contract Vault is ERC20 {
     //   Chainlink USDC/USD (often ~1)
 
     uint256 public constant MAX_ALLOWED_TOKENS = 4;
+    uint256 public constant INTIAL_SUPPLY = 100e18;
     mapping(address => TokenInfo) public tokens;
 
     EnumerableSet.AddressSet private supportedTokens;
-    mapping(address => mapping(address => uint256)) public userTokens;
+    // mapping(address => mapping(address => uint256)) public userTokens;
 
     struct TokenInfo {
         IERC20 token;
@@ -162,10 +148,10 @@ abstract contract Vault is ERC20 {
         // amount * price
         // normalize: (amount / 10**tokenDecimals) * (price / 10**feedDecimals)
         // to keep 18 decimals: amount * price * (10**18) / (10**tokenDecimals) / (10**feedDecimals)
-        return
-            (amount * price * (10 ** 18)) /
-            (10 ** tokenDecimals) /
-            (10 ** feedDecimals);
+        // return (amount * price * 1e18) / (10 ** (tokenDecimals + feedDecimals));
+
+        uint256 value = (amount * price) / (10 ** feedDecimals);
+        return (value * 1e18) / (10 ** tokenDecimals);
 
         // So:
 
@@ -187,7 +173,6 @@ abstract contract Vault is ERC20 {
             "Exceeds Maximum numbers of tokens"
         );
 
-        uint256 supply = totalSupply();
         uint256 vaultValueBeforeDeposit = totalVaultValueUsd();
 
         uint256 totalDepositValueUsd;
@@ -204,9 +189,6 @@ abstract contract Vault is ERC20 {
             // Transfer tokens to this vault from the sender
             s.token.safeTransferFrom(msg.sender, address(this), amount);
 
-            // updating deposited tokens
-            userTokens[msg.sender][tokenAddr] += amount;
-
             // compute deposit USD value (18-decimals)
             totalDepositValueUsd += _tokenValueUsd(
                 s.token,
@@ -217,10 +199,11 @@ abstract contract Vault is ERC20 {
 
         uint256 vaultValueAfterDeposit = totalVaultValueUsd();
 
+        uint256 supply = totalSupply();
         uint256 sharesMinted;
         if (supply == 0) {
             // shares and depositValueUsd both are 18-decimal units -> mint equal number of shares
-            sharesMinted = totalDepositValueUsd;
+            sharesMinted = INTIAL_SUPPLY;
         } else {
             // sharesToMint = totalDepositValueUsd * totalSupply / vaultValueBefore
             sharesMinted =
@@ -242,48 +225,62 @@ abstract contract Vault is ERC20 {
             "Invalid shares"
         );
 
-        uint256 supply = totalSupply();
-        if (supply == 0) revert("No shares to burn");
-        uint256 vaultValaueBeforeWithdraw = totalVaultValueUsd();
+        uint256 totalSharesBefore = totalSupply();
+        require(totalSharesBefore > 0, "No shares");
 
-        _burn(msg.sender, _shares);
+        uint256 n = supportedTokens.length();
+        uint256[] memory amounts = new uint256[](n);
+        uint256 withdrawUsdValue = 0;
 
-        uint256 withdrawUsdValue;
-
-        for (uint16 i = 0; i < supportedTokens.length(); i++) {
+        // 1) compute amounts and usd value using current balances and totalSharesBefore
+        for (uint256 i = 0; i < n; i++) {
             address tokenAddr = supportedTokens.at(i);
             TokenInfo storage info = tokens[tokenAddr];
+
             uint256 vaultBal = info.token.balanceOf(address(this));
-
-            // proportional amount burning
-            uint256 amountOut = (vaultBal * _shares) / supply;
-            if (amountOut == 0) continue;
-
-            uint256 userBalOfToken = userTokens[msg.sender][tokenAddr];
-
-            if (userBalOfToken < amountOut) {
-                amountOut = userBalOfToken; // Prevent over-withdraw
+            uint256 amountOut = (vaultBal * _shares) / totalSharesBefore;
+            if (_shares == totalSharesBefore) {
+                amountOut = vaultBal; // last user gets all
+            } else {
+                amountOut = Math.mulDiv(vaultBal, _shares, totalSharesBefore);
             }
+            amounts[i] = amountOut;
+
+            if (amountOut == 0) continue;
 
             withdrawUsdValue += _tokenValueUsd(
                 info.token,
                 info.priceFeed,
                 amountOut
             );
-
-            userTokens[msg.sender][tokenAddr] -= amountOut;
-
-            info.token.safeTransfer(msg.sender, amountOut);
         }
 
-        require(
-            totalVaultValueUsd() == vaultValaueBeforeWithdraw - withdrawUsdValue
-        );
+        // 2) burn shares (internal state change) after computations
+        uint256 actualBurn = _shares > balanceOf(msg.sender)
+            ? balanceOf(msg.sender)
+            : _shares;
+        _burn(msg.sender, actualBurn);
+
+        // 3) external transfers (do them after internal changes and after all amounts computed)
+        for (uint256 i = 0; i < n; i++) {
+            uint256 amt = amounts[i];
+            if (amt == 0) continue;
+
+            address tokenAddr = supportedTokens.at(i);
+            TokenInfo storage info = tokens[tokenAddr];
+
+            // defensive check to avoid underflow in token mock implementations
+            require(
+                info.token.balanceOf(address(this)) >= amt,
+                "Insufficient token balance"
+            );
+            info.token.safeTransfer(msg.sender, amt);
+        }
 
         return withdrawUsdValue;
-        // return total
-        // emit Withdraw(msg.sender, _shares, wethOut, usdcOut, valueUsd);
     }
+
+    // function quoteDeposits(uint256 amount)
 
     // ===========================
     // GETTERS
@@ -291,6 +288,43 @@ abstract contract Vault is ERC20 {
     function isSupported(address _token) public view returns (bool) {
         return tokens[_token].supported;
     }
+
+    function getSupportedTokens()
+        public
+        view
+        returns (address[] memory tokens)
+    {
+        return tokens = supportedTokens.values();
+    }
+
+    function getAllShares(address _user) public view returns (uint256) {
+        return balanceOf(_user);
+    }
+
+    function getAllSharesValueUsd(address _user) public view returns (uint256) {
+        uint256 sharesOfUser = getAllShares(_user);
+        uint256 totalSharesMinted = totalSupply();
+        if (totalSharesMinted == 0 || sharesOfUser == 0) return 0;
+        uint256 totalAmtUsd;
+        for (uint16 i = 0; i < supportedTokens.length(); i++) {
+            address tokenAddr = supportedTokens.at(i);
+            TokenInfo storage info = tokens[tokenAddr];
+            uint256 totalTokenInVault = info.token.balanceOf(address(this));
+
+            // proportional amount burning
+            uint256 amountOut = (totalTokenInVault * sharesOfUser) /
+                totalSharesMinted;
+            if (amountOut == 0) continue;
+
+            totalAmtUsd += _tokenValueUsd(
+                info.token,
+                info.priceFeed,
+                amountOut
+            );
+        }
+        return totalAmtUsd;
+    }
+    // 97000.001245062992128000
 }
 
 // function _mint(
@@ -387,3 +421,76 @@ abstract contract Vault is ERC20 {
 // }
 
 // tokens are in proportion
+// copied/adapted from Uniswap V3 FullMath (returns floor(a*b/denominator)).
+// Keeps intermediate 512-bit product so no overflow.
+/* function _mulDiv(
+        uint256 a,
+        uint256 b,
+        uint256 denominator
+    ) internal pure returns (uint256 result) {
+        unchecked {
+            uint256 prod0; // least significant 256 bits
+            uint256 prod1; // most significant 256 bits
+            assembly {
+                let mm := mulmod(a, b, not(0))
+                prod0 := mul(a, b)
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+
+            if (prod1 == 0) {
+                return prod0 / denominator;
+            }
+
+            require(denominator > prod1, "mulDiv overflow");
+
+            // Make division exact by subtracting remainder from [prod1 prod0]
+            uint256 remainder;
+            assembly {
+                remainder := mulmod(a, b, denominator)
+            }
+            assembly {
+                prod1 := sub(prod1, gt(remainder, prod0))
+                prod0 := sub(prod0, remainder)
+            }
+
+            // Factor powers of two out of denominator and compute largest power of two divisor of denominator
+            uint256 twos = denominator & (~denominator + 1);
+            assembly {
+                denominator := div(denominator, twos)
+                prod0 := div(prod0, twos)
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+
+            prod0 |= prod1 * twos;
+
+            // Compute modular inverse of denominator
+            uint256 inv = (3 * denominator) ^ 2;
+            inv = inv * (2 - denominator * inv);
+            inv = inv * (2 - denominator * inv);
+            inv = inv * (2 - denominator * inv);
+            inv = inv * (2 - denominator * inv);
+            inv = inv * (2 - denominator * inv);
+            inv = inv * (2 - denominator * inv);
+
+            result = prod0 * inv;
+            return result;
+        }
+    }
+
+    // --- safe token -> USD valuation using mulDiv to avoid overflow ---
+    function _tokenValueUsd(
+        IERC20 token,
+        AggregatorV3Interface feed,
+        uint256 amount
+    ) internal view returns (uint256) {
+        if (amount == 0) return 0;
+
+        (uint256 price, uint8 feedDecimals) = _latestPrice(feed);
+        uint8 tokenDecimals = ERC20(address(token)).decimals();
+
+        // value = amount * price / (10**feedDecimals)
+        uint256 interim = _mulDiv(amount, price, 10 ** feedDecimals);
+
+        // scale to 1e18 units: (interim * 1e18) / (10**tokenDecimals)
+        return _mulDiv(interim, 1e18, 10 ** tokenDecimals);
+    }*/
