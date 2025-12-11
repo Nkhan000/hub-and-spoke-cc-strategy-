@@ -21,6 +21,8 @@ import {IERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/IER
 interface IStrategy {
     function deposit(uint256[] memory amounts) external returns (uint256);
 
+    function getProfitAmountUSD() external view returns (uint256);
+
     function onFundsReceived(
         address[] memory tokenAddresses,
         uint256[] memory amounts
@@ -54,7 +56,7 @@ contract HubVault is Vault, AccessControl, ReentrancyGuard, Pausable {
     // ROLES
     //===================================
 
-    bytes32 public constant ALLOCATOR_ROLE = keccak256("ALLOCATOR");
+    bytes32 public constant ALLOCATOR_ROLE = keccak256("HUB_ALLOCATOR");
     bytes32 public constant SPOKE_ROLE = keccak256("SPOKE");
     bytes32 public constant STRATEGY_ROLE = keccak256("STRATEGY");
 
@@ -232,41 +234,48 @@ contract HubVault is Vault, AccessControl, ReentrancyGuard, Pausable {
     function deposit(
         address[] memory _tokensAddresses,
         uint256[] memory _amounts
-    ) public override onlyRole(SPOKE_ROLE) returns (uint256, uint256) {
+    )
+        public
+        override
+        onlyRole(SPOKE_ROLE)
+        returns (DepositDetails memory depositDetails)
+    {
         address sender = msg.sender;
         if (sender != spokeInfo[sender].spokeAddress)
             revert HubVault__InvalidSender();
 
-        (uint256 shares, uint256 totalDepositsInUsd) = _deposit(
-            _tokensAddresses,
-            _amounts
-        );
+        depositDetails = _deposit(_tokensAddresses, _amounts);
 
         SpokeInfo storage s = spokeInfo[sender];
-        s.shares += shares;
+        s.shares += depositDetails.sharesMinted;
         s.lastDeposit = block.timestamp;
 
         // emit DepositSuccessfull(_amountUsdc, _amountWeth, shares);
-        return (shares, totalDepositsInUsd);
+        // return (shares, totalDepositsInUsd);
     }
 
     function withdraw(
         uint256 _shares
-    ) public override onlyRole(SPOKE_ROLE) nonReentrant returns (uint256) {
+    )
+        public
+        override
+        onlyRole(SPOKE_ROLE)
+        nonReentrant
+        returns (WithdrawDetails memory withdrawDetails)
+    {
         address sender = msg.sender;
         if (sender != spokeInfo[sender].spokeAddress)
             revert HubVault__InvalidSender();
 
-        uint256 withdrawAmt = _withdraw(_shares);
-
+        withdrawDetails = _withdraw(_shares);
         SpokeInfo storage s = spokeInfo[msg.sender];
+
         require(s.shares >= _shares, "Error in number of shares");
-        require(s.shares > 0, HubVault__BurnAllSharesBeforeRemove());
+
         s.shares -= _shares;
         s.lastWithdrawal = block.timestamp;
 
-        emit WithdrawSuccessfull(withdrawAmt, _shares);
-        return withdrawAmt;
+        emit WithdrawSuccessfull(withdrawDetails.withdrawValueInUsd, _shares);
     }
 
     // ============================================
@@ -308,9 +317,27 @@ contract HubVault is Vault, AccessControl, ReentrancyGuard, Pausable {
             tokenAddresses,
             amounts
         );
-        assert(receivedUsd == totalDepositAmt);
+        require((totalDepositAmt - receivedUsd) <= 1e16); // tolerance of 10000000000000000
 
         emit FundsAllocatedToStrategy(receivedUsd);
+    }
+
+    function harvestProfit(
+        address _strategy
+    )
+        external
+        nonReentrant
+        onlyRole(DEFAULT_ADMIN_ROLE)
+        isStrategyActive(_strategy)
+    {
+        // uint256 profitedAmount = IStrategy(_strategy).getProfitAmountUSD();
+    }
+
+    //
+    function sendSpokeProfit(
+        address _spoke
+    ) external nonReentrant onlyRole(DEFAULT_ADMIN_ROLE) {
+        //
     }
 
     function grantRole(

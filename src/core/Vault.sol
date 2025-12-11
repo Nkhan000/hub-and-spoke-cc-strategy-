@@ -10,27 +10,41 @@ import {Math} from "../../lib/openzeppelin-contracts/contracts/utils/math/Math.s
 
 /// @title A multi token vault
 /// @author Nazir Khan
-/// @notice Handles multiple tokens (2-3) tokens sent by a liquidity provider.
+/// @notice Handles multiple assets (2-3) assets sent by a liquidity provider.
 
 abstract contract Vault is ERC20 {
     using SafeERC20 for IERC20;
     using OracleLib for AggregatorV3Interface;
     using EnumerableSet for EnumerableSet.AddressSet;
 
+    // ERROR
+    error Vault__InvalidAddress();
+
     //   Chainlink WETH/USD
     //   Chainlink USDC/USD (often ~1)
 
     uint256 public constant MAX_ALLOWED_TOKENS = 4;
-    uint256 public constant INTIAL_SUPPLY = 100e18;
-    mapping(address => TokenInfo) public tokens;
+    uint256 public constant INITIAL_SUPPLY = 100e18;
+    uint256 public constant WITHDRAWAL_COOLDOWN = 1 hours;
+    mapping(address => TokenInfo) public assets;
+    mapping(address => uint256) public lastWithdrawal;
 
-    EnumerableSet.AddressSet private supportedTokens;
-    // mapping(address => mapping(address => uint256)) public userTokens;
+    EnumerableSet.AddressSet private supportedAssets;
 
     struct TokenInfo {
         IERC20 token;
         AggregatorV3Interface priceFeed;
-        bool supported;
+        bool isActive;
+    }
+    struct DepositDetails {
+        uint256 sharesMinted;
+        uint256 totalUsdAmount;
+    }
+
+    struct WithdrawDetails {
+        address[] tokensReceived;
+        uint256[] amountsReceived;
+        uint256 withdrawValueInUsd;
     }
 
     event Deposit(
@@ -48,6 +62,10 @@ abstract contract Vault is ERC20 {
         uint256 valueUsd
     );
 
+    event NewAssetAdded(address newAsset, address priceFeed);
+    event AssetRemoved(address asset);
+    event PriceFeedUpdated(address asset, address newPriceFeed);
+
     constructor(
         address[] memory _tokens,
         address[] memory _priceFeeds
@@ -57,72 +75,60 @@ abstract contract Vault is ERC20 {
             address token = _tokens[i];
             address feed = _priceFeeds[i];
             require(token != address(0) && feed != address(0), "Zero address");
-            tokens[token] = TokenInfo({
+            assets[token] = TokenInfo({
                 token: IERC20(token),
                 priceFeed: AggregatorV3Interface(feed),
-                supported: true
+                isActive: true
             });
-            supportedTokens.add(token);
+            supportedAssets.add(token);
         }
     }
 
-    function totalVaultValueUsd() public view returns (uint256) {
-        // uint256 wethBal = weth.balanceOf(address(this)); // e.g. 5 * 1e18
-        // uint256 usdcBal = usdc.balanceOf(address(this)); // e.g. 10_000 * 1e6
-        // return
-        //     _tokenValueUsd(weth, wethUsdFeed, wethBal) +
-        //     _tokenValueUsd(usdc, usdcUsdFeed, usdcBal);
+    // function mint(
+    //         uint256 shares,
+    //         address receiver
+    //     )
 
-        uint256 totalVaultVal;
+    //       function withdraw(
+    //         uint256 assets,
+    //         address receiver,
+    //         address owner
+    //     )
 
-        for (uint16 i = 0; i < supportedTokens.length(); i++) {
-            address token = supportedTokens.at(i);
-            TokenInfo storage info = tokens[token];
-            uint256 tokenBalance = info.token.balanceOf(address(this));
-            uint256 tokenUsdBalance = _tokenValueUsd(
-                IERC20(token),
-                info.priceFeed,
-                tokenBalance
-            );
-            totalVaultVal += tokenUsdBalance;
-        }
+    //     function redeem(
+    //         uint256 shares,
+    //         address receiver,
+    //         address owner
+    //     )
 
-        return totalVaultVal;
-    }
-
-    function pricePerShare() external view returns (uint256) {
-        uint256 supply = totalSupply();
-        if (supply == 0) return 0;
-        return (totalVaultValueUsd() * (10 ** 18)) / supply; // returns USD-per-share scaled by 1e18
-    }
-
-    //===============================
+    // ===============================
     // EXTERNAL FUNCTIONS
-    //===============================
+    // ===============================
     function deposit(
+        address receiver,
         address[] memory _tokensAddresses,
         uint256[] memory _amounts
-    ) public virtual returns (uint256, uint256) {
-        return _deposit(_tokensAddresses, _amounts);
+    ) public virtual returns (DepositDetails memory) {
+        return _deposit(receiver, _tokensAddresses, _amounts);
     }
 
     function withdraw(
+        address owner,
         uint256 _shares
-    ) public virtual returns (uint256 withdrawValueInUsd) {
-        withdrawValueInUsd = _withdraw(_shares);
+    ) public virtual returns (WithdrawDetails memory) {
+        return _withdraw(owner, _shares, address(0));
     }
 
     function tokenValueUsd(
-        IERC20 token,
+        address token,
         uint256 amount
     ) public view returns (uint256) {
-        AggregatorV3Interface feed = tokens[address(token)].priceFeed;
-        return _tokenValueUsd(token, feed, amount);
+        return _tokenValueUsd(token, amount);
     }
 
-    //===============================
+    // ===============================
     // INTERNAL FUNCTIONS
-    //===============================
+    // ===============================
 
     function _latestPrice(
         AggregatorV3Interface feed
@@ -136,14 +142,13 @@ abstract contract Vault is ERC20 {
     }
 
     function _tokenValueUsd(
-        IERC20 token,
-        AggregatorV3Interface feed,
+        address asset,
         uint256 amount
     ) internal view returns (uint256) {
         if (amount == 0) return 0;
-
-        (uint256 price, uint8 feedDecimals) = _latestPrice(feed); // price with feedDecimals
-        uint8 tokenDecimals = ERC20(address(token)).decimals();
+        TokenInfo memory info = assets[asset];
+        (uint256 price, uint8 feedDecimals) = _latestPrice(info.priceFeed); // price with feedDecimals
+        uint8 tokenDecimals = ERC20(address(asset)).decimals();
 
         // amount * price
         // normalize: (amount / 10**tokenDecimals) * (price / 10**feedDecimals)
@@ -164,46 +169,50 @@ abstract contract Vault is ERC20 {
 
     // @ TODO : ADD REENTRANCY GUARD IS NEEDED OR NOT ?
     function _deposit(
+        address _receiver,
         address[] memory _tokensAddresses,
         uint256[] memory _amounts
-    ) internal returns (uint256, uint256) {
-        require(_tokensAddresses.length == _amounts.length, "Length mismatch");
-        require(
-            _tokensAddresses.length < MAX_ALLOWED_TOKENS,
-            "Exceeds Maximum numbers of tokens"
-        );
+    ) internal returns (DepositDetails memory depositDetails) {
+        uint256 len = _tokensAddresses.length;
+
+        // check for zero length
+        if (len == 0) revert("Empty assets");
+
+        // check for amounts array length being equal to tokenAddresses length
+        if (len != _amounts.length) revert("Length mismatch");
+
+        // check whether the assets are more than allowed numbers
+        if (len > supportedAssets.length())
+            revert("Exceeds Maximum numbers of assets");
+
+        if (_receiver == address(0)) revert Vault__InvalidAddress();
 
         uint256 vaultValueBeforeDeposit = totalVaultValueUsd();
-
         uint256 totalDepositValueUsd;
 
-        for (uint256 i = 0; i < _tokensAddresses.length; i++) {
-            address tokenAddr = _tokensAddresses[i];
+        for (uint256 i = 0; i < len; i++) {
+            address asset = _tokensAddresses[i];
+            // check if the token is supported or not
+            if (!isActiveAsset(asset)) revert("Token Not Supported");
+
             uint256 amount = _amounts[i];
             if (amount == 0) continue;
 
-            // check if the token is supported or not
-            require(isSupported(tokenAddr), "Token Not Supported");
-
-            TokenInfo storage s = tokens[tokenAddr];
-            // Transfer tokens to this vault from the sender
-            s.token.safeTransferFrom(msg.sender, address(this), amount);
-
             // compute deposit USD value (18-decimals)
-            totalDepositValueUsd += _tokenValueUsd(
-                s.token,
-                s.priceFeed,
-                amount
-            );
+            totalDepositValueUsd += _tokenValueUsd(asset, amount);
+
+            // Transfer assets to this vault from the sender
+            IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
         }
 
         uint256 vaultValueAfterDeposit = totalVaultValueUsd();
 
-        uint256 supply = totalSupply();
         uint256 sharesMinted;
+        uint256 supply = totalSupply();
         if (supply == 0) {
             // shares and depositValueUsd both are 18-decimal units -> mint equal number of shares
-            sharesMinted = INTIAL_SUPPLY;
+            sharesMinted = totalDepositValueUsd;
+            // sharesMinted = INITIAL_SUPPLY;
         } else {
             // sharesToMint = totalDepositValueUsd * totalSupply / vaultValueBefore
             sharesMinted =
@@ -214,33 +223,230 @@ abstract contract Vault is ERC20 {
             (vaultValueAfterDeposit - vaultValueBeforeDeposit) ==
                 totalDepositValueUsd
         );
-        _mint(msg.sender, sharesMinted);
+        _mint(_receiver, sharesMinted);
+
         // emit
-        return (sharesMinted, totalDepositValueUsd);
+
+        depositDetails = DepositDetails({
+            sharesMinted: sharesMinted,
+            totalUsdAmount: totalDepositValueUsd
+        });
     }
 
-    function _withdraw(uint256 _shares) internal returns (uint256) {
+    // function _withdrawFor(address owner, uint256 _shares)   {}
+
+    // if owner is not passed meaning called by a native user making msg.sender share holder else owner is specified through trusted periphery
+
+    function _withdraw(
+        address _owner,
+        uint256 _shares,
+        address _receiver
+    ) internal returns (WithdrawDetails memory withdrawDetails) {
+        address owner = _owner;
+
         require(
-            _shares > 0 && _shares <= balanceOf(msg.sender),
-            "Invalid shares"
+            _shares > 0 && _shares <= balanceOf(owner),
+            "Invalid/No shares"
+        );
+        require(
+            block.timestamp >= lastWithdrawal[owner] + WITHDRAWAL_COOLDOWN,
+            "Cooldown is active"
+        );
+        lastWithdrawal[owner] = block.timestamp;
+
+        (
+            ,
+            uint256[] memory amounts,
+            uint256 withdrawUsdValue
+        ) = previewWithdraw(_shares);
+
+        _burn(owner, _shares);
+
+        // 3) external transfers (do them after internal changes and after all amounts computed)
+        uint256 n = supportedAssets.length();
+        for (uint256 i = 0; i < n; i++) {
+            uint256 amt = amounts[i];
+            if (amt == 0) continue;
+
+            address asset = supportedAssets.at(i);
+            TokenInfo storage info = assets[asset];
+
+            // defensive check to avoid underflow in token mock implementations
+            require(
+                info.token.balanceOf(address(this)) >= amt,
+                "Insufficient token balance"
+            );
+            if (_receiver != address(0)) {
+                info.token.safeTransfer(_receiver, amt);
+            } else {
+                info.token.safeTransfer(owner, amt);
+            }
+        }
+        withdrawDetails = WithdrawDetails({
+            tokensReceived: supportedAssets.values(),
+            amountsReceived: amounts,
+            withdrawValueInUsd: withdrawUsdValue
+        });
+    }
+
+    // =================================================
+    // ASSETS MANAGEMENT
+    // =================================================
+
+    function _addAssets(
+        address[] calldata _newAssets,
+        address[] calldata _priceFeeds
+    ) internal {
+        require(_newAssets.length == _priceFeeds.length, "Length Mismatched");
+
+        for (uint256 i = 0; i < _newAssets.length; i++) {
+            address asset = _newAssets[i];
+            address feed = _priceFeeds[i];
+            _addAsset(asset, feed);
+        }
+    }
+
+    function _removeAssets(address[] calldata _assets) internal {
+        require(_assets.length > 0, "Invalid Length");
+
+        for (uint256 i = 0; i < _assets.length; i++) {
+            address asset = _assets[i];
+            _removeAsset(asset);
+        }
+    }
+
+    /// @notice Add a whitelisted asset.
+    function _addAsset(address _newAsset, address _priceFeed) internal {
+        require(
+            _newAsset != address(0) && _priceFeed != address(0),
+            "Invalid Address for new asset or Price Feed address"
+        );
+        require(
+            supportedAssets.length() < MAX_ALLOWED_TOKENS,
+            "MAX NUMBER OF TOKENS REACHED"
         );
 
+        require(
+            address(assets[_newAsset].token) == address(0),
+            "Asset already exists"
+        );
+
+        assets[_newAsset] = TokenInfo({
+            token: IERC20(_newAsset),
+            priceFeed: AggregatorV3Interface(_priceFeed),
+            isActive: true
+        });
+        supportedAssets.add(_newAsset);
+
+        emit NewAssetAdded(_newAsset, _priceFeed);
+    }
+
+    /// @notice Remove a whitelisted asset.
+    function _removeAsset(address _asset) internal {
+        // checks if the given asset is a valid address
+        require(
+            address(assets[_asset].token) != address(0),
+            "Asset Does not exist"
+        );
+
+        // checks if the given asset has some amount before removing
+        require(
+            IERC20(_asset).balanceOf(address(this)) < 1e6,
+            "Funds are still in the vault"
+        );
+
+        delete assets[_asset];
+        bool success = supportedAssets.remove(_asset);
+        require(success, "Address not found in the set");
+
+        emit AssetRemoved(_asset);
+    }
+
+    function _updatePriceFeed(address _asset, address _newPriceFeed) internal {
+        // checks if the given asset is a valid address
+        require(
+            address(assets[_asset].token) != address(0),
+            "Invalid asset address"
+        );
+
+        require(assets[_asset].isActive, "Invalid Asset");
+        assets[_asset].priceFeed = AggregatorV3Interface(_newPriceFeed);
+
+        emit PriceFeedUpdated(_asset, _newPriceFeed);
+        //
+    }
+
+    // ===========================
+    // GETTERS
+    // ===========================
+
+    function previewDeposit(
+        address[] calldata _assets,
+        uint256[] calldata _amounts
+    ) public view returns (uint256 shares) {
+        uint256 len = _assets.length;
+
+        require(
+            len != 0 && len != _amounts.length,
+            "Invalid length of assets and ammount"
+        );
+
+        uint256 vaultValueBeforeDeposit = totalVaultValueUsd();
+        uint256 totalDepositValueUsd;
+
+        for (uint256 i = 0; i < len; i++) {
+            address asset = _assets[i];
+            // check if the token is supported or not
+            if (!isActiveAsset(asset)) revert("asset Not Supported");
+
+            uint256 amount = _amounts[i];
+            if (amount == 0) continue;
+
+            // compute deposit USD value (18-decimals)
+            totalDepositValueUsd += _tokenValueUsd(asset, amount);
+        }
+
+        uint256 supply = totalSupply();
+        if (supply == 0) {
+            // shares and depositValueUsd both are 18-decimal units -> mint equal number of shares
+            shares = totalDepositValueUsd;
+            // shares = INITIAL_SUPPLY;
+        } else {
+            // sharesToMint = totalDepositValueUsd * totalSupply / vaultValueBefore
+            shares = (totalDepositValueUsd * supply) / vaultValueBeforeDeposit;
+        }
+    }
+
+    /**
+     * @notice Getter for getting assets and price for amount of shares to be burnt
+     * @param _shares Amount of shares to be burnt
+     * @return tokensArr An array of assets that will sent based current balance of assets of the vault
+     * @return amounts Amount array for each assets
+     * @return withdrawUsdValue Total USD amount of the assets
+     */
+    function previewWithdraw(
+        uint256 _shares
+    )
+        public
+        view
+        returns (
+            address[] memory tokensArr,
+            uint256[] memory amounts,
+            uint256 withdrawUsdValue
+        )
+    {
         uint256 totalSharesBefore = totalSupply();
-        require(totalSharesBefore > 0, "No shares");
+        uint256 n = supportedAssets.length();
+        amounts = new uint256[](n);
 
-        uint256 n = supportedTokens.length();
-        uint256[] memory amounts = new uint256[](n);
-        uint256 withdrawUsdValue = 0;
-
-        // 1) compute amounts and usd value using current balances and totalSharesBefore
         for (uint256 i = 0; i < n; i++) {
-            address tokenAddr = supportedTokens.at(i);
-            TokenInfo storage info = tokens[tokenAddr];
+            address token = supportedAssets.at(i);
+            // TokenInfo storage info = assets[token];
 
-            uint256 vaultBal = info.token.balanceOf(address(this));
+            uint256 vaultBal = IERC20(token).balanceOf(address(this));
             uint256 amountOut = (vaultBal * _shares) / totalSharesBefore;
             if (_shares == totalSharesBefore) {
-                amountOut = vaultBal; // last user gets all
+                amountOut = vaultBal; // last user gets all (remaining dust)
             } else {
                 amountOut = Math.mulDiv(vaultBal, _shares, totalSharesBefore);
             }
@@ -248,135 +454,95 @@ abstract contract Vault is ERC20 {
 
             if (amountOut == 0) continue;
 
-            withdrawUsdValue += _tokenValueUsd(
-                info.token,
-                info.priceFeed,
-                amountOut
-            );
+            withdrawUsdValue += _tokenValueUsd(token, amountOut);
         }
 
-        // 2) burn shares (internal state change) after computations
-        uint256 actualBurn = _shares > balanceOf(msg.sender)
-            ? balanceOf(msg.sender)
-            : _shares;
-        _burn(msg.sender, actualBurn);
-
-        // 3) external transfers (do them after internal changes and after all amounts computed)
-        for (uint256 i = 0; i < n; i++) {
-            uint256 amt = amounts[i];
-            if (amt == 0) continue;
-
-            address tokenAddr = supportedTokens.at(i);
-            TokenInfo storage info = tokens[tokenAddr];
-
-            // defensive check to avoid underflow in token mock implementations
-            require(
-                info.token.balanceOf(address(this)) >= amt,
-                "Insufficient token balance"
-            );
-            info.token.safeTransfer(msg.sender, amt);
-        }
-
-        return withdrawUsdValue;
+        tokensArr = supportedAssets.values();
     }
 
-    // function quoteDeposits(uint256 amount)
-
-    // ===========================
-    // GETTERS
-    // ===========================
-    function isSupported(address _token) public view returns (bool) {
-        return tokens[_token].supported;
+    /**
+     * @notice Returns true if supported else returns false
+     * @param _asset Address of tasset
+     */
+    function isActiveAsset(address _asset) public view returns (bool) {
+        return assets[_asset].isActive;
     }
 
-    function getSupportedTokens()
+    /**
+     * @notice returns an array of all the supported assets
+     */
+    function getSupportedAssets()
         public
         view
         returns (address[] memory tokensAddresses)
     {
-        tokensAddresses = supportedTokens.values();
+        tokensAddresses = supportedAssets.values();
     }
 
-    function getAllShares(address _user) public view returns (uint256) {
-        return balanceOf(_user);
+    /**
+     *
+     * @param _user Accepts user's address to check it's shares holding
+     * @return _totalShares Total amount of shares of that user (ERC20 Balance)
+     */
+    function getAllShares(
+        address _user
+    ) public view returns (uint256 _totalShares) {
+        _totalShares = balanceOf(_user);
     }
 
-    function getAllSharesValueUsd(address _user) public view returns (uint256) {
+    /**
+     * @notice returns total vault value in USD
+     */
+    function totalVaultValueUsd() public view returns (uint256 totalVaultVal) {
+        for (uint16 i = 0; i < supportedAssets.length(); i++) {
+            address token = supportedAssets.at(i);
+            uint256 tokenBalance = IERC20(token).balanceOf(address(this));
+            uint256 tokenUsdBalance = _tokenValueUsd(token, tokenBalance);
+            totalVaultVal += tokenUsdBalance;
+        }
+    }
+
+    /**
+     * @notice returns value of price per share
+     */
+    function pricePerShare() public view returns (uint256) {
+        uint256 supply = totalSupply();
+        if (supply == 0) return 0;
+        return (totalVaultValueUsd() * (10 ** 18)) / supply; // returns USD-per-share scaled by 1e18
+    }
+
+    /**
+     *
+     * @param _user Accepts user's address to check it's shares holding
+     * @return totalAmtUsd Total amount of shares in USD of that user
+     */
+    function getAllUserSharesValueUsd(
+        address _user
+    ) public view returns (uint256 totalAmtUsd) {
         uint256 sharesOfUser = getAllShares(_user);
         uint256 totalSharesMinted = totalSupply();
         if (totalSharesMinted == 0 || sharesOfUser == 0) return 0;
-        uint256 totalAmtUsd;
-        for (uint16 i = 0; i < supportedTokens.length(); i++) {
-            address tokenAddr = supportedTokens.at(i);
-            TokenInfo storage info = tokens[tokenAddr];
-            uint256 totalTokenInVault = info.token.balanceOf(address(this));
+
+        for (uint16 i = 0; i < supportedAssets.length(); i++) {
+            address token = supportedAssets.at(i);
+            uint256 totalTokenInVault = IERC20(token).balanceOf(address(this));
 
             // proportional amount burning
             uint256 amountOut = (totalTokenInVault * sharesOfUser) /
                 totalSharesMinted;
             if (amountOut == 0) continue;
 
-            totalAmtUsd += _tokenValueUsd(
-                info.token,
-                info.priceFeed,
-                amountOut
-            );
+            totalAmtUsd += _tokenValueUsd(token, amountOut);
         }
-        return totalAmtUsd;
     }
-    // 97000.001245062992128000
 }
 
-// function _mint(
-//     address _to,
-//     uint256 _amountWeth,
-//     uint256 _amountUsdc
-// ) private {
-//     //In production, always read prices from oracles (e.g., Chainlink).
-//     // combined USD value of both tokens
-//     uint256 depositValueUSD = _amountWeth *
-//         MOCK_USD_PRICE_WETH +
-//         _amountUsdc;
+// uint256 wethBal = weth.balanceOf(address(this)); // e.g. 5 * 1e18
+// uint256 usdcBal = usdc.balanceOf(address(this)); // e.g. 10_000 * 1e6
+// return
+//     _tokenValueUsd(weth, wethUsdFeed, wethBal) +
+//     _tokenValueUsd(usdc, usdcUsdFeed, usdcBal);
 
-//     // here 1 share = $1
-//     uint256 sharesToMint;
-//     if (totalShares == 0) {
-//         sharesToMint = depositValueUSD;
-//         pricePerShare = 1e18;
-//     } else {
-//         // In production, always read prices from oracles (e.g., Chainlink).
-//         uint256 vaultValueUSD = totalWETH * MOCK_USD_PRICE_WETH + totalUSDC;
-//         sharesToMint = (depositValueUSD * totalShares) / vaultValueUSD;
-//         pricePerShare =
-//             (totalWETH * MOCK_USD_PRICE_WETH + totalUSDC) /
-//             totalShares;
-//     }
-//     sharePerUser[_to] += sharesToMint;
-//     totalShares += sharesToMint;
-
-//     // emit
-// }
-
-// share price=TVL/totalSupply
-
-// function _burn(
-//     address _from,
-//     uint256 shares
-// ) private returns (uint256, uint256) {
-//     if (_from == address(0)) revert("Invalid address");
-//     if (shares == 0 || shares > sharePerUser[_from])
-//         revert("Invalid share amount");
-
-//     uint256 wethAmt = (shares * totalWETH) / totalShares;
-//     uint256 usdcAmt = (shares * totalUSDC) / totalShares;
-
-//     // updates shares account
-//     sharePerUser[_from] -= shares;
-//     totalShares -= shares;
-
-//     // emit
-//     return (wethAmt, usdcAmt);
-// }
 // function _deposit(uint256 _amount) internal {
 //     /**
 //      * a = amount to deposit
@@ -420,7 +586,7 @@ abstract contract Vault is ERC20 {
 //     _burn(msg.sender, _shares);
 // }
 
-// tokens are in proportion
+// assets are in proportion
 // copied/adapted from Uniswap V3 FullMath (returns floor(a*b/denominator)).
 // Keeps intermediate 512-bit product so no overflow.
 /* function _mulDiv(

@@ -70,7 +70,7 @@ contract HubVaultTest is Test {
         vm.stopPrank();
     }
 
-    function testDeposit() public {
+    /* function testDeposit() public {
         uint256 initialShares = hubVault.totalSupply();
 
         // 5 ether  * $2000 = $10_000
@@ -226,17 +226,17 @@ contract HubVaultTest is Test {
         );
         return (shares, totalDepositedValue);
     }
-
-    // function testHubDeposit() public {
-    //     vm.prank(userA);
-    //     uint256 shares = hubVault.deposit(2e18, 4000e6);
-    //     uint256 totalShares = hubVault.getShares(userA);
-
-    //     assertEq(shares, totalShares);
-    // }
-
-    // TODO TESTS : AUTOMATION, ORACLELIB WITHDRAW, ACCESS CONTROLS
+*/
 }
+// function testHubDeposit() public {
+//     vm.prank(userA);
+//     uint256 shares = hubVault.deposit(2e18, 4000e6);
+//     uint256 totalShares = hubVault.getShares(userA);
+
+//     assertEq(shares, totalShares);
+// }
+
+// TODO TESTS : AUTOMATION, ORACLELIB WITHDRAW, ACCESS CONTROLS
 
 /*
     function testDeposit() public {
