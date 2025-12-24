@@ -10,7 +10,7 @@ import {Math} from "../../lib/openzeppelin-contracts/contracts/utils/math/Math.s
 
 /// @title A multi token vault
 /// @author Nazir Khan
-/// @notice Handles multiple assets (2-3) assets sent by a liquidity provider.
+/// @notice Handles multiple assets sent by a liquidity provider.
 
 abstract contract Vault is ERC20 {
     using SafeERC20 for IERC20;
@@ -19,9 +19,7 @@ abstract contract Vault is ERC20 {
 
     // ERROR
     error Vault__InvalidAddress();
-
-    //   Chainlink WETH/USD
-    //   Chainlink USDC/USD (often ~1)
+    error Vault__NoValidDeposits();
 
     uint256 public constant MAX_ALLOWED_TOKENS = 4;
     uint256 public constant INITIAL_SUPPLY = 100e18;
@@ -47,12 +45,12 @@ abstract contract Vault is ERC20 {
         uint256 withdrawValueInUsd;
     }
 
-    event Deposit(
-        address indexed user,
-        uint256 sharesMinted,
-        uint256 wethIn,
-        uint256 usdcIn,
-        uint256 valueUsd
+    event Deposited(
+        address indexed receiver,
+        uint256 indexed sharesMinted,
+        address[] assetsDeposited,
+        uint256[] amountsDeposited,
+        uint256 totalDepositValueUSD
     );
     event Withdraw(
         address indexed user,
@@ -65,6 +63,9 @@ abstract contract Vault is ERC20 {
     event NewAssetAdded(address newAsset, address priceFeed);
     event AssetRemoved(address asset);
     event PriceFeedUpdated(address asset, address newPriceFeed);
+
+    event AssetEnabled(address asset);
+    event AssetDisabled(address asset);
 
     constructor(
         address[] memory _tokens,
@@ -168,41 +169,101 @@ abstract contract Vault is ERC20 {
     }
 
     // @ TODO : ADD REENTRANCY GUARD IS NEEDED OR NOT ?
+
+    function _filterSupportedTokens(
+        address[] memory _assets,
+        uint256[] memory _amounts
+    ) internal view returns (address[] memory, uint256[] memory) {
+        uint256 len = _assets.length;
+
+        // if len is greater than maximum number of tokens allowed. Example if Max number of tokens allowed are five than only five different tokens can be sent, making length only be below or equal to MAX_ALLOWED_TOKENS
+        uint256 maxTokens = supportedAssets.length(); // may be we can do something with the max length ...W
+        if (len != _amounts.length || len > maxTokens || len == 0)
+            revert("Invalid lenght");
+
+        // intially setting the size of the filtered array to maximum tokens possible
+        address[] memory filteredAssets = new address[](maxTokens);
+        uint256[] memory filteredAmounts = new uint256[](maxTokens);
+
+        uint256 uniqueCount; // 0 (for final length of array)
+
+        for (uint256 i = 0; i < len; ) {
+            address asset = _assets[i];
+            uint256 amount = _amounts[i];
+
+            // Revert if unsupported (should never happen if periphery is correct) - Maybe add it later !
+            // if (!isActiveAsset(asset)) {
+            //     revert Vault__TokenNotSupported(asset);
+            // }
+
+            // Skip zero amounts and validate support (defense in depth)
+            if (amount != 0) {
+                bool found;
+                for (uint256 j = 0; j < uniqueCount; ) {
+                    if (filteredAssets[j] == asset) {
+                        filteredAmounts[j] += amount;
+                        found = true;
+                        break;
+                    }
+
+                    unchecked {
+                        ++j;
+                    }
+                }
+                if (!found) {
+                    filteredAssets[uniqueCount] = asset;
+                    filteredAmounts[uniqueCount] = amount;
+                    unchecked {
+                        ++uniqueCount;
+                    }
+                }
+            }
+            // fixed here increamenting always
+            unchecked {
+                ++i;
+            }
+        }
+
+        assembly {
+            mstore(filteredAssets, uniqueCount)
+            mstore(filteredAmounts, uniqueCount)
+        }
+
+        if (uniqueCount == 0) {
+            revert Vault__NoValidDeposits();
+        }
+        return (filteredAssets, filteredAmounts);
+    }
+
     function _deposit(
         address _receiver,
-        address[] memory _tokensAddresses,
+        address[] memory _assets,
         uint256[] memory _amounts
     ) internal returns (DepositDetails memory depositDetails) {
-        uint256 len = _tokensAddresses.length;
-
-        // check for zero length
-        if (len == 0) revert("Empty assets");
-
-        // check for amounts array length being equal to tokenAddresses length
-        if (len != _amounts.length) revert("Length mismatch");
-
-        // check whether the assets are more than allowed numbers
-        if (len > supportedAssets.length())
-            revert("Exceeds Maximum numbers of assets");
-
         if (_receiver == address(0)) revert Vault__InvalidAddress();
 
         uint256 vaultValueBeforeDeposit = totalVaultValueUsd();
         uint256 totalDepositValueUsd;
+        (
+            address[] memory filteredAssets,
+            uint256[] memory filteredAmounts
+        ) = _filterSupportedTokens(_assets, _amounts);
 
-        for (uint256 i = 0; i < len; i++) {
-            address asset = _tokensAddresses[i];
-            // check if the token is supported or not
-            if (!isActiveAsset(asset)) revert("Token Not Supported");
+        uint256 len = filteredAssets.length;
 
-            uint256 amount = _amounts[i];
-            if (amount == 0) continue;
+        for (uint256 i = 0; i < len; ) {
+            address asset = filteredAssets[i];
+            uint256 amount = filteredAmounts[i];
 
             // compute deposit USD value (18-decimals)
             totalDepositValueUsd += _tokenValueUsd(asset, amount);
 
             // Transfer assets to this vault from the sender
             IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
+
+            unchecked {
+                ++i;
+            }
         }
 
         uint256 vaultValueAfterDeposit = totalVaultValueUsd();
@@ -212,20 +273,33 @@ abstract contract Vault is ERC20 {
         if (supply == 0) {
             // shares and depositValueUsd both are 18-decimal units -> mint equal number of shares
             sharesMinted = totalDepositValueUsd;
-            // sharesMinted = INITIAL_SUPPLY;
+            // sharesMinted = INITIAL_SUPPLY; // or mint fixed amount of shares as in initial supply
         } else {
             // sharesToMint = totalDepositValueUsd * totalSupply / vaultValueBefore
             sharesMinted =
                 (totalDepositValueUsd * supply) /
                 vaultValueBeforeDeposit;
         }
+
+        //  tolerance check
+        uint256 actualIncrease = vaultValueAfterDeposit -
+            vaultValueBeforeDeposit;
+        // checks if the actual increase is not less than 1% from original deposit
         require(
-            (vaultValueAfterDeposit - vaultValueBeforeDeposit) ==
-                totalDepositValueUsd
+            actualIncrease >= (totalDepositValueUsd * 99) / 100,
+            "Value mismatch"
         );
+
         _mint(_receiver, sharesMinted);
 
-        // emit
+        // ✅ Emit event
+        emit Deposited(
+            _receiver,
+            sharesMinted,
+            filteredAssets,
+            filteredAmounts,
+            totalDepositValueUsd
+        );
 
         depositDetails = DepositDetails({
             sharesMinted: sharesMinted,
@@ -233,16 +307,13 @@ abstract contract Vault is ERC20 {
         });
     }
 
-    // function _withdrawFor(address owner, uint256 _shares)   {}
-
-    // if owner is not passed meaning called by a native user making msg.sender share holder else owner is specified through trusted periphery
-
     function _withdraw(
         address _owner,
         uint256 _shares,
         address _receiver
     ) internal returns (WithdrawDetails memory withdrawDetails) {
         address owner = _owner;
+        if (_owner == address(0)) revert Vault__InvalidAddress();
 
         require(
             _shares > 0 && _shares <= balanceOf(owner),
@@ -276,12 +347,11 @@ abstract contract Vault is ERC20 {
                 info.token.balanceOf(address(this)) >= amt,
                 "Insufficient token balance"
             );
-            if (_receiver != address(0)) {
-                info.token.safeTransfer(_receiver, amt);
-            } else {
-                info.token.safeTransfer(owner, amt);
-            }
+            address receiver = _receiver == address(0) ? owner : _receiver;
+            info.token.safeTransfer(receiver, amt);
         }
+        // emit
+
         withdrawDetails = WithdrawDetails({
             tokensReceived: supportedAssets.values(),
             amountsReceived: amounts,
@@ -373,7 +443,22 @@ abstract contract Vault is ERC20 {
         assets[_asset].priceFeed = AggregatorV3Interface(_newPriceFeed);
 
         emit PriceFeedUpdated(_asset, _newPriceFeed);
-        //
+    }
+
+    function _disableAsset(address _asset) internal {
+        TokenInfo storage asset = assets[_asset];
+        require(address(asset.token) != address(0), "Invalid asset address");
+
+        asset.isActive = false;
+        emit AssetDisabled(address(asset.token));
+    }
+
+    function _enableAsset(address _asset) internal {
+        TokenInfo storage asset = assets[_asset];
+        require(address(asset.token) != address(0), "Invalid asset address"); // ?
+
+        asset.isActive = true;
+        emit AssetEnabled(address(asset.token));
     }
 
     // ===========================
@@ -387,7 +472,7 @@ abstract contract Vault is ERC20 {
         uint256 len = _assets.length;
 
         require(
-            len != 0 && len != _amounts.length,
+            len != 0 && len == _amounts.length,
             "Invalid length of assets and ammount"
         );
 
@@ -426,43 +511,35 @@ abstract contract Vault is ERC20 {
      */
     function previewWithdraw(
         uint256 _shares
-    )
-        public
-        view
-        returns (
-            address[] memory tokensArr,
-            uint256[] memory amounts,
-            uint256 withdrawUsdValue
-        )
-    {
+    ) public view returns (address[] memory, uint256[] memory, uint256) {
         uint256 totalSharesBefore = totalSupply();
         uint256 n = supportedAssets.length();
-        amounts = new uint256[](n);
+        uint256[] memory amounts = new uint256[](n);
+        uint256 withdrawUsdValue;
 
         for (uint256 i = 0; i < n; i++) {
-            address token = supportedAssets.at(i);
-            // TokenInfo storage info = assets[token];
+            uint256 amountOut;
+            address asset = supportedAssets.at(i);
 
-            uint256 vaultBal = IERC20(token).balanceOf(address(this));
-            uint256 amountOut = (vaultBal * _shares) / totalSharesBefore;
+            uint256 vaultBal = IERC20(asset).balanceOf(address(this));
+
             if (_shares == totalSharesBefore) {
                 amountOut = vaultBal; // last user gets all (remaining dust)
             } else {
                 amountOut = Math.mulDiv(vaultBal, _shares, totalSharesBefore);
             }
             amounts[i] = amountOut;
-
-            if (amountOut == 0) continue;
-
-            withdrawUsdValue += _tokenValueUsd(token, amountOut);
+            withdrawUsdValue += _tokenValueUsd(asset, amountOut);
         }
 
-        tokensArr = supportedAssets.values();
+        address[] memory tokensArr = supportedAssets.values();
+
+        return (tokensArr, amounts, withdrawUsdValue);
     }
 
     /**
-     * @notice Returns true if supported else returns false
-     * @param _asset Address of tasset
+     * @notice Returns true if supported/active else returns false. As if it is either not supported or not active `.isActive` will return false
+     * @param _asset Address of asset
      */
     function isActiveAsset(address _asset) public view returns (bool) {
         return assets[_asset].isActive;
@@ -481,25 +558,25 @@ abstract contract Vault is ERC20 {
 
     /**
      *
-     * @param _user Accepts user's address to check it's shares holding
-     * @return _totalShares Total amount of shares of that user (ERC20 Balance)
+     * @param account Accepts user's address to check it's shares holding
+     * @return Total amount of shares of that user (ERC20 Balance)
      */
-    function getAllShares(
-        address _user
-    ) public view returns (uint256 _totalShares) {
-        _totalShares = balanceOf(_user);
+    function getAllShares(address account) public view returns (uint256) {
+        return balanceOf(account);
     }
 
     /**
-     * @notice returns total vault value in USD
+     * @notice Total vault value in USD
      */
-    function totalVaultValueUsd() public view returns (uint256 totalVaultVal) {
+    function totalVaultValueUsd() public view returns (uint256) {
+        uint256 totalVaultVal;
         for (uint16 i = 0; i < supportedAssets.length(); i++) {
             address token = supportedAssets.at(i);
             uint256 tokenBalance = IERC20(token).balanceOf(address(this));
             uint256 tokenUsdBalance = _tokenValueUsd(token, tokenBalance);
             totalVaultVal += tokenUsdBalance;
         }
+        return totalVaultVal;
     }
 
     /**

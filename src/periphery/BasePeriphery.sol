@@ -8,7 +8,7 @@ import {CCIPReceiver} from "../../lib/ccip/contracts/src/v0.8/ccip/applications/
 import {IERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {ReentrancyGuard} from "../../lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "../../lib/openzeppelin-contracts/contracts/utils/Pausable.sol";
-import {SpokeVault} from "../core/SpokeVault.sol";
+import {MainVault} from "../core/MainVault.sol";
 import {EnumerableSet} from "../../lib/openzeppelin-contracts/contracts/utils/structs/EnumerableSet.sol";
 import {SafeERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {OracleLib, AggregatorV3Interface} from "../libraries/OracleLib.sol";
@@ -18,7 +18,7 @@ import {OracleLib, AggregatorV3Interface} from "../libraries/OracleLib.sol";
  * @title  Periphery
  * @notice Contract for Periphery contract that coordinates deposits/withdrawals
  * @dev Handles both native (same-chain) and cross-chain operations via CCIP
- * Works with Spoke Vault that extends abstract Vault contract with multi-asset support
+ * Works with main Vault that extends abstract Vault contract with multi-asset support
  * Main periphery (on vault chain) inherits CCIPReceiver
  * Remote peripheries (on other chains) send messages to main periphery
  */
@@ -51,6 +51,8 @@ contract BasePeriphery is
     error BasePeriphery__InvalidShares();
     error BasePeriphery__RequestNotFound(uint8 requestId);
     error BasePeriphery__RequestAlreadyProcessed(uint8 requestId);
+    // error BasePeriphery__UnsupportedToken();
+    error BasePeriphery__InvalidOrSupportedTokensReceived();
 
     // ================================================================
     // EVENTS
@@ -92,6 +94,14 @@ contract BasePeriphery is
         uint256 fee
     );
 
+    event BasePeriphery__FundsWithdrawn(
+        address provider,
+        uint256 shares,
+        uint256[] amountsReceived,
+        address[] tokensReceived,
+        bool isCrossChain
+    );
+
     // ================================================================
     // STRUCTS
     // ================================================================
@@ -123,14 +133,17 @@ contract BasePeriphery is
 
     // uint64[] internal allowedChains;
     mapping(uint64 => bool) public allowedChains;
+    // Storage for tracking approvals
+    mapping(address => bool) private _approvedToVault;
 
     uint8 internal nextRequestId;
-    SpokeVault spoke;
+    MainVault main;
 
     // ================================================================
     // CONSTANTS
     // ================================================================
     uint16 public constant MAX_ALLOWED_CHAINS = 4;
+    uint256 public constant TOLERANCE = 1000;
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
     address public ROUTER;
     address public LINK_TOKEN;
@@ -145,15 +158,15 @@ contract BasePeriphery is
     constructor(
         address _router,
         address _linkToken,
-        address _spoke
+        address _main
     ) CCIPReceiver(_router) {
         if (
             _router == address(0) ||
-            _spoke == address(0) ||
+            _main == address(0) ||
             _linkToken == address(0)
         ) revert BasePeriphery__ZeroAddress();
 
-        spoke = SpokeVault(_spoke);
+        main = MainVault(_main);
 
         ROUTER = _router;
         LINK_TOKEN = _linkToken;
@@ -197,8 +210,8 @@ contract BasePeriphery is
 
         // check whether the sender is allowed or not
         address sender = abi.decode(message.sender, (address));
-        if (!isAllowedSender[sourceChain][sender])
-            revert("Unauthorized cross-chain sender");
+        // if (!isAllowedSender[sourceChain][sender])
+        //     revert("Unauthorized cross-chain sender");
 
         // decoding the payload (address of owner of shares(provider) and type of operation)
         (address provider, uint8 opr, uint256 shares) = abi.decode(
@@ -223,135 +236,6 @@ contract BasePeriphery is
         emit CrossChainMessageReceived();
     }
 
-    /**
-     * @notice for native senders
-     * @param provider Receiver of the shares after depositing tokens
-     * @param tokens tokens array
-     * @param amounts amounts array
-     */
-    function deposit(
-        address provider,
-        address[] memory tokens,
-        uint256[] memory amounts
-    ) public nonReentrant returns (SpokeVault.DepositDetails memory) {
-        return _handleDeposit(provider, tokens, amounts, false);
-
-        // emit BasePeriphery__DepositReceived(provider, tokens, amounts);
-    }
-
-    /**
-     * @param provider address of provider from the different chain
-     * @param tokenAmtsArr array of tokens and respective amounts
-     * @param sourceChain chain selector from where the transaction initiated
-     */
-    function _handleCrossChainDeposit(
-        address provider,
-        Client.EVMTokenAmount[] memory tokenAmtsArr,
-        uint64 sourceChain
-    ) internal returns (SpokeVault.DepositDetails memory) {
-        (
-            address[] memory tokens,
-            uint256[] memory amounts
-        ) = _decodeAndValidateEvmTokenAmount(tokenAmtsArr);
-
-        // CCIP already delivered tokens to this contract
-        return _handleDeposit(provider, tokens, amounts, true);
-    }
-
-    function _handleDeposit(
-        address provider,
-        address[] memory tokens,
-        uint256[] memory amounts,
-        bool isCrossChain
-    ) internal returns (SpokeVault.DepositDetails memory) {
-        // this way we only transfer supported tokens to this protocol
-        (
-            address[] memory supportedTokens,
-            uint256[] memory filteredAmounts
-        ) = _filterSupportedTokens(tokens, amounts);
-
-        LiquidityProvider storage providerInfo = providers[provider];
-        if (!isCrossChain) {
-            for (uint16 i = 0; i < supportedTokens.length; i++) {
-                address token = supportedTokens[i];
-                uint256 amt = filteredAmounts[i];
-                if (amt == 0) continue;
-
-                IERC20(token).safeTransferFrom(provider, address(this), amt);
-            }
-        }
-        SpokeVault.DepositDetails memory depositDetails = spoke.deposit(
-            provider,
-            tokens,
-            amounts
-        );
-
-        return depositDetails;
-    }
-
-    // =====================================
-    // WITHDRAWAL FUNCTIONS
-    // =====================================
-
-    /**
-     * @notice native user calls this function for withdrawing their shares on spoke
-     * @param shares amount of shares to burn
-     * @dev In this case msg.sender can be the address of provider for _handleWithdraw function as it is a native user
-     */
-    function withdraw(
-        uint256 shares
-    ) external returns (SpokeVault.WithdrawDetails memory withdrawDetails) {
-        return _handleWithdraw(msg.sender, shares, false);
-    }
-
-    /**
-     *
-     * @param provider address of the user who owns the shares
-     * @param shares amount of shares to burn
-     * @param isCrossChain Boolean for whether operation is for cross chain or native chain
-     */
-    function _handleWithdraw(
-        address provider,
-        uint256 shares,
-        bool isCrossChain
-    ) internal returns (SpokeVault.WithdrawDetails memory withdrawDetails) {
-        // calculate the balance before the withdraw -> will help in cross chain function
-
-        if (!isCrossChain) {
-            withdrawDetails = spoke.withdraw(provider, shares);
-        } else {
-            withdrawDetails = spoke.withdrawTo(provider, shares);
-        }
-    }
-
-    function _handleCrossChainWithdrawal(
-        address provider,
-        uint256 shares,
-        uint64 _sourceChainSelector
-    ) internal {
-        // check for balance received when withdraw funds
-        (, , uint256 expectedValue) = spoke.quoteWithdraw(shares);
-        SpokeVault.WithdrawDetails memory withdrawDetails = _handleWithdraw(
-            provider,
-            shares,
-            true
-        );
-
-        require(
-            withdrawDetails.withdrawValueInUsd == expectedValue,
-            "Invalid Amount Withdrawn"
-        );
-
-        // create a ccip message and send the funds to the original sender
-        _sendCCIPMessage(
-            withdrawDetails.tokensReceived,
-            withdrawDetails.amountsReceived,
-            provider,
-            _sourceChainSelector,
-            bytes("")
-        );
-    }
-
     // =============================================
     // CROSS CHAIN MESSAGE SEND
     // =============================================
@@ -369,22 +253,27 @@ contract BasePeriphery is
 
         if (tokens.length != amounts.length) revert("Invalid length");
         uint256 len = tokens.length;
+
         Client.EVMTokenAmount[]
             memory tokenAmounts = new Client.EVMTokenAmount[](len);
 
         // 1. Approve token pool for this token
         // Get the correct token pool for this token + chain
-        for (uint16 i = 0; i < len; i++) {
+        for (uint16 i = 0; i < len; ) {
             address token = tokens[i];
             uint256 amt = amounts[i];
 
             // Safely approving ROUTER to spend the asset
-            IERC20(token).approve(ROUTER, 0);
-            IERC20(token).approve(ROUTER, amt);
+            IERC20(token).forceApprove(ROUTER, amt);
+
             tokenAmounts[i] = Client.EVMTokenAmount({
                 token: token,
                 amount: amt
             });
+
+            unchecked {
+                ++i;
+            }
         }
 
         bytes memory data = _data;
@@ -401,7 +290,7 @@ contract BasePeriphery is
         });
 
         // decision are yet to be made to use native tokens as fees or link token
-        // for now we will stick with native tokens
+        // for now we will stick with link tokens
 
         // calculate fee
         uint256 fee = IRouterClient(ROUTER).getFee(_chainSelector, message);
@@ -419,40 +308,200 @@ contract BasePeriphery is
         emit CCIPMessageSent(messageId, message, fee);
     }
 
-    // ===========================================
-    function _filterSupportedTokens(
+    // ===================================================
+    // DEPOSIT/ WITHDRAW
+    // ===================================================
+
+    /**
+     * @notice for native senders
+     * @param provider Receiver of the shares after depositing tokens
+     * @param tokens tokens array
+     * @param amounts amounts array
+     */
+    function deposit(
+        address provider,
         address[] memory tokens,
         uint256[] memory amounts
-    ) internal returns (address[] memory, uint256[] memory) {
-        uint256 len = tokens.length;
-        uint256 supportedCount = 0;
+    )
+        public
+        nonReentrant
+        whenNotPaused
+        returns (MainVault.DepositDetails memory)
+    {
+        return _handleDeposit(provider, tokens, amounts, false, 0);
 
-        for (uint256 i = 0; i < len; i++) {
-            if (spoke.isSupportedToken(tokens[i])) supportedCount++;
-        }
+        // emit BasePeriphery__DepositReceived(provider, tokens, amounts);
+    }
 
-        address[] memory filtered = new address[](supportedCount);
-        uint256[] memory filteredAmounts = new uint256[](supportedCount);
-        uint256 j = 0;
+    /**
+     * @param provider address of provider from the different chain
+     * @param tokenAmtsArr array of tokens and respective amounts
+     * @param sourceChain chain selector from where the transaction initiated
+     */
+    function _handleCrossChainDeposit(
+        address provider,
+        Client.EVMTokenAmount[] memory tokenAmtsArr,
+        uint64 sourceChain
+    ) internal returns (MainVault.DepositDetails memory) {
+        (
+            address[] memory tokens,
+            uint256[] memory amounts
+        ) = _decodeAndValidateEvmTokenAmount(tokenAmtsArr);
 
-        for (uint256 i = 0; i < len; i++) {
-            if (spoke.isSupportedToken(tokens[i])) {
-                filtered[j] = tokens[i];
-                filteredAmounts[j] = amounts[i];
-                j++;
+        // CCIP already delivered tokens to this contract
+        return _handleDeposit(provider, tokens, amounts, true, sourceChain);
+    }
+
+    function _handleDeposit(
+        address provider,
+        address[] memory assets,
+        uint256[] memory amounts,
+        bool isCrossChain,
+        uint64 sourceChain
+    ) internal returns (MainVault.DepositDetails memory depositDetails) {
+        uint256 len = assets.length;
+        address[] memory supportedAssets = main.getSupportedAssets();
+        if (len > supportedAssets.length || len == 0)
+            revert("Invalid length of tokens or amounts");
+
+        // bool containsUnsupported = false;
+        // check for unsupported asset. If unsupported asset than revert entire batch
+        for (uint256 i = 0; i < len; ) {
+            if (!main.isActiveAsset(assets[i])) {
+                if (isCrossChain) {
+                    _sendCCIPMessage(
+                        assets,
+                        amounts,
+                        provider,
+                        sourceChain,
+                        ""
+                    );
+                }
+                revert BasePeriphery__InvalidOrSupportedTokensReceived();
+            }
+            unchecked {
+                ++i;
             }
         }
 
-        return (filtered, filteredAmounts);
+        // now all the tokens are active/supported
+        for (uint256 i = 0; i < len; ) {
+            address asset = assets[i];
+            uint256 amt = amounts[i];
+
+            if (amt != 0) {
+                if (!isCrossChain) {
+                    IERC20(asset).safeTransferFrom(
+                        provider,
+                        address(this),
+                        amt
+                    );
+                }
+                // IERC20(asset).forceApprove(address(main), type(uint256).max); // maximum approval
+                if (!_approvedToVault[asset]) {
+                    IERC20(asset).forceApprove(
+                        address(main),
+                        type(uint256).max
+                    );
+                    _approvedToVault[asset] = true;
+                }
+            }
+
+            unchecked {
+                ++i;
+            }
+        }
+        // sends the supported assets to the main (list may contain duplicate but will be filtered on vault end)
+        depositDetails = main.deposit(provider, assets, amounts);
+    }
+
+    // =====================================
+    // WITHDRAWAL FUNCTIONS
+    // =====================================
+
+    /**
+     * @notice native user calls this function for withdrawing their shares on main
+     * @param shares amount of shares to burn
+     * @dev In this case msg.sender can be the address of provider for _handleWithdraw function as it is a native user
+     */
+    function withdraw(
+        uint256 shares
+    )
+        external
+        nonReentrant
+        whenNotPaused
+        returns (MainVault.WithdrawDetails memory withdrawDetails)
+    {
+        if (shares == 0) revert BasePeriphery__InvalidShares();
+
+        // emit
+        return _handleWithdraw(msg.sender, shares, false);
+    }
+
+    /**
+     * @param provider address of the user who owns the shares
+     * @param shares amount of shares to burn
+     * @param isCrossChain Boolean for whether operation is for cross chain or native chain
+     */
+    function _handleWithdraw(
+        address provider,
+        uint256 shares,
+        bool isCrossChain
+    ) internal returns (MainVault.WithdrawDetails memory withdrawDetails) {
+        if (shares == 0) revert BasePeriphery__InvalidShares();
+
+        if (provider == address(0)) revert BasePeriphery__ZeroAddress();
+        // calculate the balance before the withdraw -> will help in cross chain function
+
+        if (!isCrossChain) {
+            withdrawDetails = main.withdraw(provider, shares); // withdraws assets to the native users
+        } else {
+            withdrawDetails = main.withdrawTo(provider, shares); // withdraws assets to the periphery
+        }
+        emit BasePeriphery__FundsWithdrawn(
+            provider,
+            shares,
+            withdrawDetails.amountsReceived,
+            withdrawDetails.tokensReceived,
+            isCrossChain
+        );
+    }
+
+    function _handleCrossChainWithdrawal(
+        address provider,
+        uint256 shares,
+        uint64 _sourceChainSelector
+    ) internal {
+        // check for balance received when withdraw funds
+        // (, , uint256 expectedValue) = main.previewWithdraw(shares);
+        MainVault.WithdrawDetails memory withdrawDetails = _handleWithdraw(
+            provider,
+            shares,
+            true
+        );
+
+        // create a ccip message and send the funds to the original sender
+        _sendCCIPMessage(
+            withdrawDetails.tokensReceived,
+            withdrawDetails.amountsReceived,
+            provider,
+            _sourceChainSelector,
+            bytes("")
+        );
     }
 
     function _decodeAndValidateEvmTokenAmount(
         Client.EVMTokenAmount[] memory tokenAmtsArr
-    ) internal returns (address[] memory tokens, uint256[] memory amounts) {
+    )
+        internal
+        view
+        returns (address[] memory tokens, uint256[] memory amounts)
+    {
         uint256 len = tokenAmtsArr.length;
-        if (len == 0 || len > spoke.MAX_ALLOWED_TOKENS())
-            // tokens length from the spoke
+        if (len == 0 || len > main.MAX_ALLOWED_TOKENS())
+            // tokens length from the main
             revert BasePeriphery__LengthMismatch();
+
         tokens = new address[](len);
         amounts = new uint256[](len);
 
@@ -525,27 +574,12 @@ contract BasePeriphery is
     // ADMIN / TOKEN MANAGEMENT
     // ================================================================
 
-    function addTokenInfo() external onlyRole(DEFAULT_ADMIN_ROLE) {}
-
     function setAllowedSender(
         uint64 chainId,
         address sender,
         bool allowed
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         isAllowedSender[chainId][sender] = allowed;
-    }
-
-    function addSupportedToken(
-        address token,
-        address priceFeed
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        // TODO: add new token + feed with checks
-    }
-
-    function removeSupportedToken(
-        address token
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        // TODO: remove token from supported list + mapping
     }
 
     function togglePause() external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -561,6 +595,6 @@ contract BasePeriphery is
     }
 
     function isChainAllowed(uint64 selector) public view returns (bool) {
-        // TODO: iterate allowedChains
+        return allowedChains[selector];
     }
 }

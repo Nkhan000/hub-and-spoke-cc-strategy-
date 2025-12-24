@@ -12,14 +12,17 @@ import {Pausable} from "../../lib/openzeppelin-contracts/contracts/utils/Pausabl
 import {CCIPReceiver} from "../../lib/ccip/contracts/src/v0.8/ccip/applications/CCIPReceiver.sol";
 import {IRouterClient} from "../../lib/ccip/contracts/src/v0.8/ccip/interfaces/IRouterClient.sol";
 import {AccessControl} from "../../lib/openzeppelin-contracts/contracts/access/AccessControl.sol";
-import {HubVault} from "../core/HubVault.sol";
 
-contract SpokeVault is Vault, AccessControl, Pausable, ReentrancyGuard {
+contract MainVault is Vault, AccessControl, Pausable, ReentrancyGuard {
     //ERRORS
-    error SpokeVault__ProviderAlreadyExists();
-    error SpokeVault__InvalidChainSelector();
-    error SpokeVault__InvalidAddress();
-    error SpokeVault__NotAllowedPeriphery();
+    error MainVault__ProviderAlreadyExists();
+    error MainVault__InvalidChainSelector();
+    error MainVault__InvalidAddress();
+    error MainVault__NotAllowedPeriphery();
+    error MainVault__SlippageExceeded(
+        uint256 sharesMinted,
+        uint256 minSharesOut
+    );
 
     // EVENTS
     event LiquidityProviderAdded();
@@ -27,18 +30,6 @@ contract SpokeVault is Vault, AccessControl, Pausable, ReentrancyGuard {
     event RoleGranted(address _account, bytes32 _role);
     event RoleRevoked(address _account, bytes32 _role);
 
-    event TransferredFundsToHub(
-        address[] tokensDeposited,
-        uint256[] amountsDeposited,
-        uint256 sharesMinted,
-        uint256 totalValueDeposited
-    );
-    event WithdrawnFundsFromHub(
-        address[] tokensReceived,
-        uint256[] amountsReceived,
-        uint256 sharesBurnt,
-        uint256 totalValueReceived
-    );
     event DepositReceivedFromPeriphery(
         address receiver,
         address[] tokensAddresses,
@@ -57,7 +48,7 @@ contract SpokeVault is Vault, AccessControl, Pausable, ReentrancyGuard {
     event BasePeripheryEnabled();
 
     // CONSTANTS & IMMUTABLES
-    // address public immutable BASE_PERIPHERY_CONTRACT;
+
     // STATE VARIABLES
 
     // STRUCTS
@@ -69,13 +60,6 @@ contract SpokeVault is Vault, AccessControl, Pausable, ReentrancyGuard {
         bool isActive;
     }
 
-    struct HubInfo {
-        address hub;
-        uint256 totalProfitEarned;
-        uint256 lastAllocated;
-        uint256 lastWithdrawal;
-    }
-
     // ROLES
 
     bytes32 public constant ALLOCATOR_ROLE = keccak256("SPOKE_ALLOCATOR");
@@ -84,22 +68,20 @@ contract SpokeVault is Vault, AccessControl, Pausable, ReentrancyGuard {
     // MAPPINGS
     // mapping(address => BasePeripheryInfo) public basePeripheryInfo;
     BasePeripheryInfo public basePeriphery;
-    HubInfo public hubInfo;
 
     // MODIFIERS
     modifier isPeriphery(address _periphery) {
         if (_periphery != basePeriphery.periphery)
-            revert SpokeVault__NotAllowedPeriphery();
+            revert MainVault__NotAllowedPeriphery();
         _;
     }
 
     constructor(
         address[] memory _tokens,
         address[] memory _priceFeeds,
-        address _periphery,
-        address _hub
+        address _periphery
     ) Vault(_tokens, _priceFeeds) {
-        require(_periphery != address(0), SpokeVault__InvalidAddress());
+        require(_periphery != address(0), MainVault__InvalidAddress());
 
         basePeriphery = BasePeripheryInfo({
             periphery: _periphery,
@@ -107,13 +89,6 @@ contract SpokeVault is Vault, AccessControl, Pausable, ReentrancyGuard {
             lastDeposit: 0,
             lastWithdrawal: 0,
             isActive: true
-        });
-
-        hubInfo = HubInfo({
-            hub: _hub,
-            totalProfitEarned: 0,
-            lastAllocated: 0,
-            lastWithdrawal: 0
         });
 
         // CHAIN_SELECTOR = _chainSelector;
@@ -131,6 +106,7 @@ contract SpokeVault is Vault, AccessControl, Pausable, ReentrancyGuard {
     )
         public
         override
+        nonReentrant
         onlyRole(PERIPHERY_ROLE)
         returns (DepositDetails memory depositDetails)
     {
@@ -157,6 +133,8 @@ contract SpokeVault is Vault, AccessControl, Pausable, ReentrancyGuard {
     )
         public
         override
+        nonReentrant
+        whenNotPaused
         onlyRole(PERIPHERY_ROLE)
         returns (WithdrawDetails memory withdrawDetails)
     {
@@ -175,6 +153,8 @@ contract SpokeVault is Vault, AccessControl, Pausable, ReentrancyGuard {
         uint256 _shares
     )
         external
+        nonReentrant
+        whenNotPaused
         onlyRole(PERIPHERY_ROLE)
         returns (WithdrawDetails memory withdrawDetails)
     {
@@ -185,58 +165,6 @@ contract SpokeVault is Vault, AccessControl, Pausable, ReentrancyGuard {
             withdrawDetails.tokensReceived,
             withdrawDetails.amountsReceived,
             _shares
-        );
-    }
-
-    // ===========================================
-    // HUB VAULT FUNCIONTS
-    // ===========================================
-
-    // @notice called by spoke vault owner to send all funds to the hub vault
-    function transferAllFundsToHub() external onlyRole(DEFAULT_ADMIN_ROLE) {
-        uint256[] memory amounts;
-        address[] memory tokensAddress = getSupportedTokens();
-
-        transferFundsToHub(amounts, tokensAddress);
-    }
-
-    // @notice called by spoke vault owner to send funds to the hub vault
-    function transferFundsToHub(
-        uint256[] memory amounts,
-        address[] memory tokensAddress
-    ) public onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(
-            amounts.length == tokensAddress.length,
-            "Invalid lengths for amounts and tokens"
-        );
-        for (uint256 i = 0; i < tokensAddress.length; i++) {
-            amounts[i] = IERC20(tokensAddress[i]).balanceOf(address(this)); //
-            IERC20(tokensAddress[i]).approve(hubInfo.hub, amounts[i]);
-        }
-        DepositDetails memory depositDetailsOnHub = HubVault(hubInfo.hub)
-            .deposit(tokensAddress, amounts);
-
-        emit TransferredFundsToHub(
-            tokensAddress,
-            amounts,
-            depositDetailsOnHub.sharesMinted,
-            depositDetailsOnHub.totalUsdAmount
-        );
-    }
-
-    // @notice called by spoke vault owner to withdraw funds from the HUB VAULT
-    function withdrawFromHub(
-        uint256 _shares
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        WithdrawDetails memory withdrawDetails = HubVault(hubInfo.hub).withdraw(
-            _shares
-        );
-
-        emit WithdrawnFundsFromHub(
-            withdrawDetails.tokensReceived,
-            withdrawDetails.amountsReceived,
-            _shares,
-            withdrawDetails.withdrawValueInUsd
         );
     }
 
@@ -266,13 +194,14 @@ contract SpokeVault is Vault, AccessControl, Pausable, ReentrancyGuard {
             lastWithdrawal: 0,
             isActive: true
         });
+        grantRole(PERIPHERY_ROLE, newPeriphery.periphery);
         basePeriphery = newPeriphery;
 
         emit BasePeripheryUpdated(_newPeriphery);
     }
 
     function disablePeriphery() external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (!basePeriphery.isActive) return;
+        if (!basePeriphery.isActive) return; // do we need this check ??
         basePeriphery.isActive = false;
 
         emit BasePeripheryDisabled();
@@ -283,6 +212,40 @@ contract SpokeVault is Vault, AccessControl, Pausable, ReentrancyGuard {
         basePeriphery.isActive = true;
 
         emit BasePeripheryEnabled();
+    }
+
+    // ===========================================
+    // TOKEN MANAGEMENT
+    // ===========================================
+
+    function addAssets(
+        address[] calldata _newAssets,
+        address[] calldata _priceFeeds
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _addAssets(_newAssets, _priceFeeds);
+    }
+
+    function removeAssets(
+        address[] calldata _newAssets
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _removeAssets(_newAssets);
+    }
+
+    function updatePriceFeed(
+        address _asset,
+        address _newPriceFeed
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _updatePriceFeed(_asset, _newPriceFeed);
+    }
+
+    function enableAsset(address _asset) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _enableAsset(_asset);
+    }
+
+    function disableAsset(
+        address _asset
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _disableAsset(_asset);
     }
 
     // ===========================================
@@ -306,11 +269,7 @@ contract SpokeVault is Vault, AccessControl, Pausable, ReentrancyGuard {
     }
 
     // Emergency functions
-    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _pause();
-    }
-
-    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _unpause();
+    function togglePause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        paused() ? _unpause() : _pause();
     }
 }
