@@ -92,6 +92,11 @@ interface IVault is IERC20 {
     }
 
     //
+    function getSupportedAssets()
+        external
+        view
+        returns (address[] memory tokensAddresses);
+
     function shareValueUsd(uint256 shares) external view returns (uint256);
 
     function getIdleFundsUsd() external view returns (uint256);

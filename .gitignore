@@ -16,8 +16,12 @@ docs/
 outline.md
 
 
+
+ 
+
 # files
-src/periphery/*
-src/crosschain/*
-src/interfaces/hub-spoke-vault-analysis.md
-src/interfaces/ISpokeVault.sol
+/src/periphery/*
+/src/crosschain/*
+/src/interfaces/hub-spoke-vault-analysis.md
+# hub-spoke-vault-analysis.md
+# src/interfaces/ISpokeVault.sol

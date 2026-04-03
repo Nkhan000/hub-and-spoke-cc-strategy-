@@ -1697,7 +1697,7 @@ function _handleWithdraw(
 
 | Priority | Task                                            | Effort    |
 | -------- | ----------------------------------------------- | --------- |
-| 1        | Fix `_filterSupportedTokens` loop               | 5 min     |
+| 1        | Fix `_filterSupportedTokens` loops              | 5 min     |
 | 2        | Fix `previewWithdraw` amounts                   | 5 min     |
 | 3        | Fix `transferFundsToHub` bugs                   | 10 min    |
 | 4        | Remove strict equality check in `_deposit`      | 2 min     |

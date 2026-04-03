@@ -238,7 +238,7 @@ abstract contract WithdrawalQueue is IWithdrawalQueue {
         address _receiver,
         uint64 _destChain,
         uint256 _shares
-    ) internal virtual;
+    ) internal view virtual;
 
     function _afterQueueWithdrawal(
         address _owner,

@@ -141,56 +141,6 @@ contract MainVault is
         _creditShares(_sourceChain, _receiver, depositDetails.sharesMinted);
     }
 
-    // HOOK
-    function _beforeQueueWithdrawal(
-        address _owner,
-        address _receiver,
-        uint64 _destChain,
-        uint256 _shares
-    ) internal override {
-        require(_owner != address(0), "Invalid Owner");
-
-        (uint256 available, , ) = getSharesInfo(_destChain, _owner);
-        if (_shares > available) revert("Insufficient Shares");
-
-        if (_receiver == address(0) && msg.sender != basePeriphery.periphery)
-            revert(
-                "Only periphery can call this function with receiver being zero address"
-            );
-    }
-
-    function _afterQueueWithdrawal(
-        address _owner,
-        uint256 _shares,
-        uint64 _destChain
-    ) internal override {
-        // Lock shares AFTER successful queue creation
-        _lockShares(_owner, _shares, _destChain);
-    }
-
-    function _beforeCancelWithdraw(
-        address _owner,
-        uint256 _shares,
-        uint64 _destChain
-    ) internal override {
-        // unLock shares before successful queue canceling
-        _unlockShares(_owner, _shares, _destChain);
-    }
-
-    function _afterClaimWithdraw(
-        uint256 shares,
-        address owner,
-        address receiver,
-        uint64 destChain
-    ) internal override returns (WithdrawDetails memory withdrawDetails) {
-        // unclock shares
-        _unlockShares(owner, shares, destChain);
-        // debit shares
-        _debitShares(destChain, owner, shares);
-        // actual withdrawal and transfer the tokens
-        withdrawDetails = _withdraw(owner, shares, receiver);
-    }
-
     // @notice periphery calls this withdraw function to burn shares and receive funds
     // for native withdrawers
     function addWithdrawalInQueue(
@@ -248,6 +198,59 @@ contract MainVault is
         WithdrawalRequest storage request = _withdrawalRequests[_requestId];
         if (request.requestId == bytes32(0)) revert("Invalid Process Id");
         return request;
+    }
+
+    // ========================================
+    // HOOKS FOR WITHDRAWAL QUEUE
+    // ========================================
+
+    function _beforeQueueWithdrawal(
+        address _owner,
+        address _receiver,
+        uint64 _destChain,
+        uint256 _shares
+    ) internal view override {
+        require(_owner != address(0), "Invalid Owner");
+
+        (uint256 available, , ) = getSharesInfo(_destChain, _owner);
+        if (_shares > available) revert("Insufficient Shares");
+
+        if (_receiver == address(0) && msg.sender != basePeriphery.periphery)
+            revert(
+                "Only periphery can call this function with receiver being zero address"
+            );
+    }
+
+    function _afterQueueWithdrawal(
+        address _owner,
+        uint256 _shares,
+        uint64 _destChain
+    ) internal override {
+        // Lock shares AFTER successful queue creation
+        _lockShares(_owner, _shares, _destChain);
+    }
+
+    function _beforeCancelWithdraw(
+        address _owner,
+        uint256 _shares,
+        uint64 _destChain
+    ) internal override {
+        // unLock shares before successful queue canceling
+        _unlockShares(_owner, _shares, _destChain);
+    }
+
+    function _afterClaimWithdraw(
+        uint256 shares,
+        address owner,
+        address receiver,
+        uint64 destChain
+    ) internal override returns (WithdrawDetails memory withdrawDetails) {
+        // unclock shares
+        _unlockShares(owner, shares, destChain);
+        // debit shares
+        _debitShares(destChain, owner, shares);
+        // actual withdrawal and transfer the tokens
+        withdrawDetails = _withdraw(owner, shares, receiver);
     }
 
     // ===========================================
