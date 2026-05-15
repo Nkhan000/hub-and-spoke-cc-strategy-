@@ -73,7 +73,7 @@ abstract contract Vault is ERC20, IVault {
         uint8 tokenDecimals = ERC20(address(asset)).decimals();
 
         // amount * price
-        // normalize: (amount / 10**tokenDecimals) * (price / 10**feedDecimals)
+        // normalize: (amount / 10**tokenDecimals) * (price / 10 ** feedDecimals)
         // to keep 18 decimals: amount * price * (10**18) / (10**tokenDecimals) / (10**feedDecimals)
         // return (amount * price * 1e18) / (10 ** (tokenDecimals + feedDecimals));
 
