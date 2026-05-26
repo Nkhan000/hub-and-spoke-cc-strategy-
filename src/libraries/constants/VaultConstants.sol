@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 library VaultConstants {
     // CONSTANT AND IMMUTABLES
-    uint256 public constant MAX_ALLOWED_TOKENS = 4;
+    uint256 public constant MAX_ALLOWED_TOKENS = 10;
     uint256 public constant INITIAL_SUPPLY = 100e18;
     uint256 public constant WITHDRAWAL_COOLDOWN = 1 hours;
 
